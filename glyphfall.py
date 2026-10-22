@@ -103,6 +103,52 @@ ELABEL = {'more_dmg': '+{}% More Damage', 'hp_mult': '{:+}% Max Life', 'sk_dmg':
           'bp_cheap': 'costs half the life', 'bp_long': 'lasts {} more turns', 'bp_power': 'buff +{}% stronger'}
 
 
+# ---- runes: socketed into gear. 'stat' runes add stats, 'tag' runes boost every skill that carries the tag.
+# pct mode scales x1.5 per tier (keeps pace with depth tiers), int mode adds base per 2 tiers. 3 runes of a tier fuse into 1 of the next.
+RUNES = {
+    'ember': dict(name='Ember', kind='stat', stat='fire_pct', base=12, mode='pct'),
+    'rime': dict(name='Rime', kind='stat', stat='cold_pct', base=12, mode='pct'),
+    'volt': dict(name='Volt', kind='stat', stat='lightning_pct', base=12, mode='pct'),
+    'bone': dict(name='Bone', kind='stat', stat='phys_pct', base=12, mode='pct'),
+    'venom': dict(name='Venom', kind='stat', stat='poison_pct', base=12, mode='pct'),
+    'soul': dict(name='Soul', kind='stat', stat='necro_pct', base=12, mode='pct'),
+    'vigor': dict(name='Vigor', kind='stat', stat='hp', base=14, mode='pct'),
+    'mind': dict(name='Mind', kind='stat', stat='mana', base=10, mode='pct'),
+    'edge': dict(name='Edge', kind='stat', stat='weapon', base=3, mode='pct'),
+    'ward': dict(name='Ward', kind='stat', stat='armor', base=8, mode='pct'),
+    'fang': dict(name='Fang', kind='stat', stat='leech', base=2, mode='int'),
+    'eye': dict(name='Eye', kind='stat', stat='crit', base=3, mode='int'),
+    'fortune': dict(name='Fortune', kind='stat', stat='find', base=8, mode='pct'),
+    'might': dict(name='Might', kind='stat', stat='dmg_pct', base=6, mode='pct'),
+    'arc': dict(name='Arc', kind='tag', tag='chain', stat='sk_chain', base=1, mode='int'),
+    'reach': dict(name='Reach', kind='tag', tag='aoe', stat='sk_radius', base=1, mode='int'),
+    'distance': dict(name='Distance', kind='tag', tag='projectile', stat='sk_range', base=2, mode='int'),
+    'cinder': dict(name='Cinder', kind='tag', tag='fire', stat='sk_burn', base=25, mode='pct'),
+    'chill': dict(name='Chill', kind='tag', tag='cold', stat='sk_slow', base=1, mode='int'),
+    'blight': dict(name='Blight', kind='tag', tag='poison', stat='dur', base=2, mode='int'),
+    'brawn': dict(name='Brawn', kind='tag', tag='melee', stat='sk_dmg', base=15, mode='pct'),
+    'swift': dict(name='Swift', kind='tag', tag='all', stat='sk_cd', base=1, mode='int'),
+    'echo': dict(name='Echo', kind='tag', tag='all', stat='sk_echo', base=6, mode='pct'),
+}
+SOCKET_MAX = {'normal': 1, 'magic': 2, 'rare': 3, 'legend': 3, 'mythic': 4, 'unique': 2}
+
+
+def rune_split(rk):
+    t, n = rk.split(':')
+    return t, int(n)
+
+
+def rune_val(rk):
+    t, n = rune_split(rk)
+    d = RUNES[t]
+    return max(1, int(d['base'] * 1.5 ** (n - 1))) if d['mode'] == 'pct' else d['base'] * (1 + (n - 1) // 2)
+
+
+def rune_name(rk):
+    t, n = rune_split(rk)
+    return f'{RUNES[t]["name"]} T{n}'
+
+
 SLOTNAME = {'weapon': 'Weapon', 'armor': 'Armor', 'charm': 'Amulet'}
 CONS = {'hp': ('Health Potion', 'Heal 40% of max life'), 'mp': ('Mana Potion', 'Restore 60% of max mana'),
         'rejuv': ('Rejuvenation', 'Heal and restore 50% of both'), 'map': ('Map Scroll', 'Reveal the whole level')}
@@ -200,6 +246,7 @@ class Game:
         self.mastery = {}
         self.chests, self.potion_cd = {}, 0
         self.filter = {'normal': 'salvage', 'magic': 'keep', 'rare': 'keep'}
+        self.runes = {}
         self.ms, self.cur = {}, None
         self.face = (1, 0)
         self.turn = 0
@@ -214,7 +261,7 @@ class Game:
                  equip=self.equip, pack=self.pack, known=self.known, slots=self.slots, hp=self.hp, mana=self.mana, turn=self.turn,
                  best=getattr(self, 'best', self.depth), deaths=getattr(self, 'deaths', 0),
                  mastery={k: dict(m, alloc=sorted(m['alloc'])) for k, m in self.mastery.items()},
-                 cons=self.cons, keys=self.keys, res=self.res, filter=self.filter)
+                 cons=self.cons, keys=self.keys, res=self.res, filter=self.filter, runes=self.runes)
         os.makedirs(os.path.dirname(SAVE), exist_ok=True)
         with open(SAVE + '.tmp', 'w') as f:
             json.dump(d, f)
@@ -237,6 +284,7 @@ class Game:
         g.cons, g.keys, g.res = d.get('cons', {'hp': 2, 'mp': 1}), d.get('keys', 0), d.get('res', {'scrap': 0, 'essence': 0})
         g.potion_cd, g.chests = 0, {}
         g.filter = d.get('filter', {'normal': 'salvage', 'magic': 'keep', 'rare': 'keep'})
+        g.runes = d.get('runes', {})
         g.face, g.turn, g.dead = (1, 0), d['turn'], False
         g.depth = d['depth'] - 1
         g.best, g.deaths = d.get('best', d['depth']), d.get('deaths', 0)
@@ -286,6 +334,10 @@ class Game:
                 add(dict(it['aff']))
         for p in self.alloc:
             add(node_at(self.seed, *p)['stats'])
+        for it in self.equip.values():
+            for rk in (it or {}).get('sockets', []):
+                if rk and RUNES[rune_split(rk)[0]]['kind'] == 'stat':
+                    add({RUNES[rune_split(rk)[0]]['stat']: rune_val(rk)})
         pw = self.powers()
         if 'glass_idol' in pw:
             add({'more_dmg': 40 * pw['glass_idol'], 'hp_mult': -25 * pw['glass_idol']})
@@ -442,7 +494,8 @@ class Game:
         name = base if rar == 'normal' else f'{r.choice(PRE)} {base}' if rar == 'magic' else \
             f'{r.choice(RARE_A)}{r.choice(RARE_B).lower()} {base}' if rar == 'rare' else \
             f'★ {r.choice(RARE_A)}{r.choice(RARE_B).lower()}, the {base}' if rar == 'legend' else f'☀ Mythic {r.choice(RARE_A)}{r.choice(RARE_B).lower()} {base}'
-        it = dict(slot=slot, rarity=rar, name=name, aff=aff, ilvl=ilvl)
+        it = dict(slot=slot, rarity=rar, name=name, aff=aff, ilvl=ilvl,
+                  sockets=[None] * r.randint(1 if rar in ('rare', 'legend', 'mythic') else 0, SOCKET_MAX[rar]))
         if rar in ('legend', 'mythic'):
             it['power'], it['rank'] = r.choice(LEGEND_POWERS), 2 if rar == 'mythic' else 1
         return it
@@ -460,6 +513,9 @@ class Game:
 
     def salvage(self, i):
         it = self.pack.pop(i)
+        for rk in it.get('sockets', []):
+            if rk:
+                self.runes[rk] = self.runes.get(rk, 0) + 1
         sc, es = self.salvage_value(it)
         self.res['scrap'] += sc
         self.res['essence'] += es
@@ -473,8 +529,7 @@ class Game:
         self.res['essence'] -= ess
         return True
 
-    def reroll(self, i):
-        it = self.pack[i]
+    def reroll(self, it):
         cost = self.reroll_cost(it)
         if not cost:
             self.say('Normal gear is not worth it')
@@ -491,8 +546,7 @@ class Game:
         self.say(f'Reforged {it["name"]} for depth {self.depth}')
         return True
 
-    def ascend(self, i):
-        it = self.pack[i]
+    def ascend(self, it):
         if it['rarity'] != 'legend':
             self.say('Only legendary gear ascends')
             return False
@@ -503,8 +557,47 @@ class Game:
         it['name'] = '☀ Mythic ' + it['name'][2:]
         it['ilvl'] = self.depth
         it['aff'] = self.roll_affixes(it['slot'], 'mythic', self.depth)
+        it.setdefault('sockets', [])
+        while len(it['sockets']) < 3:
+            it['sockets'].append(None)
         self.say(f'ASCENDED: {it["name"]}')
         return True
+
+    def new_rune(self, bonus=0):
+        t = 1 + self.depth // 10 + (1 if self.rng.random() < 0.2 + bonus else 0)
+        return f'{self.rng.choice(list(RUNES))}:{t}'
+
+    def fuse(self, rk):
+        t, n = rune_split(rk)
+        if self.runes.get(rk, 0) < 3:
+            self.say(f'Need 3 {rune_name(rk)} to fuse')
+            return False
+        self.runes[rk] -= 3
+        up = f'{t}:{n + 1}'
+        self.runes[up] = self.runes.get(up, 0) + 1
+        self.say(f'Fused -> {rune_name(up)}')
+        return True
+
+    def socket_cost(self, it):
+        n = len(it.get('sockets', []))
+        return int(100 * (1 + self.depth / 10) * 2 ** n), 5 * 2 ** n
+
+    def add_socket(self, it):
+        if len(it.setdefault('sockets', [])) >= 6:
+            self.say('Six sockets is the limit')
+            return False
+        if not self.pay(*self.socket_cost(it)):
+            return False
+        it['sockets'].append(None)
+        self.say(f'Socket added ({len(it["sockets"])})')
+        return True
+
+    def unequip(self, slot):
+        it = self.equip[slot]
+        if it:
+            self.pack.append(it)
+            self.equip[slot] = None
+            self.hp = min(self.hp, self.st('hp'))
 
     def use_cons(self, kind):
         if self.cons.get(kind, 0) <= 0:
@@ -545,6 +638,7 @@ class Game:
             self.drop_unique(x, y)
         if self.rng.random() < 0.5:
             self.items.setdefault((x, y), []).append(dict(slot='cons', kind=self.rng.choice(['rejuv', 'hp', 'mp', 'map']), rarity='magic'))
+        self.items.setdefault((x, y), []).append(dict(slot='rune', rune=self.new_rune(0.3), rarity='legend'))
         self.res['scrap'] += 5 * self.depth
         self.say('The chest bursts open!')
         return True
@@ -554,7 +648,7 @@ class Game:
         u = self.rng.choice([u for u in UNIQUES if u['name'] not in have] or UNIQUES)
         sc = (1 + 0.08 * self.depth) * (1.5 ** ((self.depth - 1) // 10))
         return dict(slot=u['slot'], rarity='unique', name=u['name'], aff=[(k, max(1, int(v * sc))) for k, v in u['base'].items()],
-                    ilvl=self.depth, power=u['power'], rank=1)
+                    ilvl=self.depth, power=u['power'], rank=1, sockets=[None] * 2)
 
     def drop_unique(self, x, y):
         self.items.setdefault((x, y), []).append(self.make_unique())
@@ -579,6 +673,9 @@ class Game:
             elif it['slot'] == 'cons':
                 self.cons[it['kind']] = self.cons.get(it['kind'], 0) + 1
                 self.say(f'Picked up {CONS[it["kind"]][0]}')
+            elif it['slot'] == 'rune':
+                self.runes[it['rune']] = self.runes.get(it['rune'], 0) + 1
+                self.say(f'Picked up {rune_name(it["rune"])} rune')
             elif it['slot'] == 'key':
                 self.keys += 1
                 self.say('Picked up a Dungeon Key')
@@ -685,6 +782,8 @@ class Game:
         nk = 2 if e['boss'] else 1 if e['champ'] and r.random() < 0.6 else 1 if r.random() < 0.02 else 0
         for _ in range(nk):
             self.items.setdefault((e['x'], e['y']), []).append(dict(slot='key', rarity='rare'))
+        for _ in range(3 if e['boss'] else 1 if (e['champ'] and r.random() < 0.5) or r.random() < 0.06 else 0):
+            self.items.setdefault((e['x'], e['y']), []).append(dict(slot='rune', rune=self.new_rune(0.1), rarity='legend'))
         if r.random() < 0.12:
             k = r.choices(['hp', 'mp', 'rejuv', 'map'], [45, 35, 8, 12])[0]
             self.items.setdefault((e['x'], e['y']), []).append(dict(slot='cons', kind=k, rarity='magic'))
@@ -723,6 +822,12 @@ class Game:
         tags = SKILLS[key]['tags']
         m = dict(self.mstats(key))
         add = lambda k, v: m.__setitem__(k, m.get(k, 0) + v)
+        for it in self.equip.values():
+            for rk in (it or {}).get('sockets', []):
+                if rk:
+                    d = RUNES[rune_split(rk)[0]]
+                    if d['kind'] == 'tag' and (d['tag'] == 'all' or d['tag'] in tags):
+                        add(d['stat'], rune_val(rk))
         for p, r in self.powers().items():
             if p == 'cinder_heart' and 'fire' in tags:
                 add('fb_explode', 30 * r)
@@ -1248,7 +1353,7 @@ def draw(win, g, btns, touch):
     for (x, y), its in g.items.items():
         if (x, y) in g.vis and inside(y - cy0, x - cx0):
             it = its[-1]
-            put(win, y - cy0 + my0, x - cx0 + mx0, {'gem': '◈', 'cons': '!', 'key': '⚷'}.get(it['slot'], '◆'), cp(RCOL[it['rarity']], True))
+            put(win, y - cy0 + my0, x - cx0 + mx0, {'gem': '◈', 'cons': '!', 'key': '⚷', 'rune': '◇'}.get(it['slot'], '◆'), cp(RCOL[it['rarity']], True))
     for (x, y) in g.chests:
         if g.seen[y][x] and inside(y - cy0, x - cx0):
             put(win, y - cy0 + my0, x - cx0 + mx0, '▣', cp(4, True))
@@ -1300,12 +1405,24 @@ KEYS = {ord('h'): (-1, 0), ord('l'): (1, 0), ord('k'): (0, -1), ord('j'): (0, 1)
         ord('y'): (-1, -1), ord('u'): (1, -1), ord('b'): (-1, 1), ord('n'): (1, 1)}
 
 
+def rune_effect(g, rk):
+    d = RUNES[rune_split(rk)[0]]
+    txt = g.aff_text(d['stat'], rune_val(rk))
+    return txt if d['kind'] == 'stat' else f'{d["tag"]} skills: {txt}'
+
+
 def item_lines(g, it):
     if it['slot'] == 'gem':
         sk = SKILLS[it['skill']]
         return [(f'Skill gem: {sk["name"]}', cp(7, True)), (sk['desc'], 0), ('Tags: ' + ' '.join(sorted(sk['tags'])), curses.A_DIM)]
     out = [(it['name'], cp(RCOL[it['rarity']], True)), (f'{it["rarity"]} {SLOTNAME[it["slot"]]} ilvl {it.get("ilvl", 1)}', curses.A_DIM)]
     out += [('  ' + g.aff_text(k, v), 0) for k, v in it['aff']]
+    for rk in it.get('sockets', []):
+        if rk:
+            d = RUNES[rune_split(rk)[0]]
+            out.append((f'  ◇ {rune_name(rk)}: ' + rune_effect(g, rk), cp(7)))
+        else:
+            out.append(('  ○ empty socket', curses.A_DIM))
     if it.get('power'):
         nm, fn = POWER_TEXT[it['power']]
         out.append((f'{"☀" if it["rarity"] == "mythic" else "★"} {nm}' + (' II' if it.get('rank', 1) > 1 else ''), cp(RCOL[it['rarity']], True)))
@@ -1317,13 +1434,22 @@ def scroll_top(sel, avail, n):
     return max(0, min(sel - avail + 1, n - avail)) if sel >= avail else 0
 
 
-TABS = [('Weap', 'weapon'), ('Armor', 'armor'), ('Amulet', 'charm'), ('Items', 'cons'), ('Keys', 'key'), ('Res', 'res')]
+TABS = [('Worn', 'worn'), ('Weap', 'weapon'), ('Armor', 'armor'), ('Amulet', 'charm'), ('Items', 'cons'), ('Keys', 'key'), ('Runes', 'rune'), ('Res', 'res')]
 PAGE = 16
 
 
 def bag_entries(g, tab):
     kind = TABS[tab][1]
     dim = curses.A_DIM
+    if kind == 'worn':
+        return [dict(kind='gear', worn=True, slot=sl, it=it, label=it['name'], attr=cp(RCOL[it['rarity']], True))
+                for sl, it in g.equip.items() if it]
+    if kind == 'rune':
+        ks = sorted([k for k, n in g.runes.items() if n > 0], key=lambda k: (-rune_split(k)[1], k))
+        return [dict(kind='rune', key=k, label=f'{rune_name(k)} x{g.runes[k]}', attr=cp(7, True),
+                     lines=[(rune_name(k) + ' rune', cp(7, True)), (rune_effect(g, k), 0), (f'You have {g.runes[k]}', dim),
+                            ('3 of the same fuse into 1 of the next tier.' + ('' if g.runes[k] >= 3 else ' (need 3)'), dim),
+                            ('Socket them into gear from the Socket button.', dim)]) for k in ks]
     if kind in SLOTNAME:
         return [dict(kind='gear', idx=i, it=it, label=it['name'], attr=cp(RCOL[it['rarity']], True))
                 for i, it in enumerate(g.pack) if it['slot'] == kind]
@@ -1389,6 +1515,91 @@ def menu_filter(win, g):
                 g.say(f'Swept {k} items (+{sc} scrap)')
 
 
+def menu_socket(win, g, it):
+    ssel, rsel, last_tap = 0, 0, None
+    while True:
+        win.erase()
+        h, w = win.getmaxyx()
+        half = w // 2
+        btns = []
+        socks = it.setdefault('sockets', [])
+        ssel = min(ssel, max(0, len(socks) - 1))
+        put(win, 0, 0, it['name'] + '   (tap a socket, tap a rune twice to insert)', cp(RCOL[it['rarity']], True))
+        if socks:
+            sw = min(16, w // len(socks))
+            for i, rk in enumerate(socks):
+                a = cp(7, True) if rk else curses.A_DIM
+                if i == ssel:
+                    a |= curses.A_REVERSE
+                button(win, btns, 1, i * sw, 3, sw, [(rune_name(rk) if rk else 'empty')[:sw - 2]], 3000 + i, a)
+        else:
+            put(win, 2, 0, 'No sockets. Use Add socket.', curses.A_DIM)
+        runes = sorted([(k, n) for k, n in g.runes.items() if n > 0], key=lambda kv: (-rune_split(kv[0])[1], kv[0]))
+        nr = len(runes)
+        rsel = min(rsel, max(0, nr - 1))
+        avail = max(2, (h - 9) // 2)
+        top = scroll_top(rsel, avail, nr)
+        put(win, 4, 0, f'Runes ({nr} kinds)', curses.A_DIM)
+        for i in range(top, min(nr, top + avail)):
+            y = 5 + 2 * (i - top)
+            k, n = runes[i]
+            put(win, y, 0, ('>' if i == rsel else ' ') + f'{rune_name(k)} x{n}', cp(7, i == rsel))
+            btns.append((y, 0, 2, half, 4000 + i))
+        y = 5
+        if socks and socks[ssel]:
+            put(win, y, half + 1, f'In socket: {rune_name(socks[ssel])}', cp(7, True))
+            put(win, y + 1, half + 1, rune_effect(g, socks[ssel]))
+            y += 3
+        if nr:
+            put(win, y, half + 1, f'Selected: {rune_name(runes[rsel][0])}', cp(4, True))
+            put(win, y + 1, half + 1, rune_effect(g, runes[rsel][0]))
+        sc, es = g.socket_cost(it)
+        put(win, h - 5, half + 1, f'Add socket: {sc} scrap + {es} ess', curses.A_DIM)
+        put(win, h - 4, 0, g.log[-1] if g.log else '')
+        defs = [('↑', ord('k')), ('↓', ord('j')), ('Insert', 10), ('Remove', ord('x')), ('Add socket', ord('a')), ('Back', 27)]
+        bw = w // len(defs)
+        for i, (lab, key) in enumerate(defs):
+            button(win, btns, h - 3, i * bw, 3, bw, [lab], key, curses.A_DIM)
+        win.refresh()
+        c = getin(win, btns)
+        if c == -1 or isinstance(c, tuple):
+            continue
+        if 3000 <= c < 3100:
+            ssel = c - 3000
+            continue
+        if 4000 <= c < 4100:
+            i = c - 4000
+            if i == last_tap:
+                c = 10
+            else:
+                rsel = last_tap = i
+                continue
+        if c in (27, ord('q')):
+            return
+        last_tap = None
+        if c in (curses.KEY_DOWN, ord('j')) and nr:
+            rsel = (rsel + 1) % nr
+        elif c in (curses.KEY_UP, ord('k')) and nr:
+            rsel = (rsel - 1) % nr
+        elif c in (curses.KEY_LEFT, ord('h')) and socks:
+            ssel = (ssel - 1) % len(socks)
+        elif c in (curses.KEY_RIGHT, ord('l')) and socks:
+            ssel = (ssel + 1) % len(socks)
+        elif c in (10, 13) and socks and nr:
+            rk, old = runes[rsel][0], socks[ssel]
+            g.runes[rk] -= 1
+            if old:
+                g.runes[old] = g.runes.get(old, 0) + 1
+            socks[ssel] = rk
+            g.hp = min(g.hp, g.st('hp'))
+        elif c == ord('x') and socks and socks[ssel]:
+            g.runes[socks[ssel]] = g.runes.get(socks[ssel], 0) + 1
+            socks[ssel] = None
+            g.hp = min(g.hp, g.st('hp'))
+        elif c == ord('a'):
+            g.add_socket(it)
+
+
 def menu_inv(win, g):
     tab, sel, last_tap, armed = 0, 0, None, None
     while True:
@@ -1402,7 +1613,7 @@ def menu_inv(win, g):
         btns = []
         tw = w // len(TABS)
         for i, (lab, kind) in enumerate(TABS):
-            cnt = sum(1 for it in g.pack if it['slot'] == kind) if kind in SLOTNAME else ''
+            cnt = sum(1 for it in g.pack if it['slot'] == kind) if kind in SLOTNAME else sum(1 for v in g.equip.values() if v) if kind == 'worn' else ''
             button(win, btns, 0, i * tw, 3, tw, [f'{lab} {cnt}'.strip()], 1000 + i, cp(4, True) if i == tab else curses.A_DIM)
         ch = max(1, min(3, (h - 7) // 4))
         cw = half // 4
@@ -1432,20 +1643,26 @@ def menu_inv(win, g):
                 sc, es = g.salvage_value(it)
                 rc = g.reroll_cost(it)
                 y = max(y + 1, h - 11)
-                put(win, y, half + 1, f'Salvage +{sc} scrap' + (f' +{es} ess' if es else ''), curses.A_DIM)
+                if not e.get('worn'):
+                    put(win, y, half + 1, f'Salvage +{sc} scrap' + (f' +{es} ess' if es else ''), curses.A_DIM)
                 if rc:
                     put(win, y + 1, half + 1, f'Reroll {rc[0]} scrap' + (f' + {rc[1]} ess' if rc[1] else '') + ' (refits to depth)', curses.A_DIM)
                 if it['rarity'] == 'legend':
                     k = 1 + g.depth / 10
                     put(win, y + 2, half + 1, f'Ascend {int(400 * k)} scrap + 40 ess -> mythic', curses.A_DIM)
                 eq = g.equip[it['slot']]
-                put(win, y + 3, half + 1, 'Equipped: ' + (eq['name'] if eq else '-'), cp(RCOL[eq['rarity']]) if eq else curses.A_DIM)
+                if not e.get('worn'):
+                    put(win, y + 3, half + 1, 'Equipped: ' + (eq['name'] if eq else '-'), cp(RCOL[eq['rarity']]) if eq else curses.A_DIM)
         bw = w // 7
         defs = [('Pg◀', ord(',')), ('Pg▶', ord('.'))]
-        if e and e['kind'] == 'gear':
-            defs += [('Equip', 10), ('Salvage', ord('v')), ('Reroll', ord('r')), ('Ascend', ord('a'))]
+        if e and e['kind'] == 'gear' and e.get('worn'):
+            defs += [('Unequip', 10), ('Socket', ord('o')), ('Reroll', ord('r')), ('Ascend', ord('a'))]
+        elif e and e['kind'] == 'gear':
+            defs += [('Equip', 10), ('Socket', ord('o')), ('Salvage', ord('v')), ('Reroll', ord('r')), ('Ascend', ord('a'))]
         elif e and e['kind'] == 'cons':
             defs += [('Use', 10)]
+        elif e and e['kind'] == 'rune':
+            defs += [('Fuse', 10)]
         defs += [('Filter', ord('f')), ('Back', 27)]
         bw = w // len(defs)
         for i, (lab, key) in enumerate(defs):
@@ -1486,11 +1703,17 @@ def menu_inv(win, g):
             sel = min(max(0, n - 1), sel + PAGE)
         elif e and c in (10, 13):
             last_tap = None
-            if e['kind'] == 'gear':
+            if e['kind'] == 'gear' and e.get('worn'):
+                g.unequip(e['slot'])
+            elif e['kind'] == 'gear':
                 g.equip_item(e['idx'])
             elif e['kind'] == 'cons':
                 g.use_cons(e['key'])
-        elif e and e['kind'] == 'gear' and c in (ord('v'), ord('r'), ord('a')):
+            elif e['kind'] == 'rune':
+                g.fuse(e['key'])
+        elif e and e['kind'] == 'gear' and c == ord('o'):
+            menu_socket(win, g, e['it'])
+        elif e and e['kind'] == 'gear' and not (e.get('worn') and c == ord('v')) and c in (ord('v'), ord('r'), ord('a')):
             it = e['it']
             if it['rarity'] in ('rare', 'legend', 'mythic', 'unique') and armed != (c, sel):
                 armed = (c, sel)
@@ -1500,9 +1723,9 @@ def menu_inv(win, g):
             if c == ord('v'):
                 g.salvage(e['idx'])
             elif c == ord('r'):
-                g.reroll(e['idx'])
+                g.reroll(it)
             else:
-                g.ascend(e['idx'])
+                g.ascend(it)
 
 
 def menu_skills(win, g):
