@@ -1,0 +1,10 @@
+#!/bin/sh
+# Native launcher: rotate the panel, run the pygame front end, rotate back on exit.
+export SWAYSOCK=$(ls /run/user/10000/sway-ipc.*.sock | head -1)
+export SDL_VIDEO_WAYLAND_WMCLASS=glyphfall
+OUT=DSI-1
+restore() { swaymsg output "$OUT" transform normal >/dev/null; }
+trap restore EXIT INT TERM HUP
+swaymsg output "$OUT" transform "${GF_ROT:-90}" >/dev/null
+sleep 0.6
+python3 "$HOME/projects/glyphfall/glyphfall_gui.py" "$@"

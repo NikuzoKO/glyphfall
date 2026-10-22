@@ -237,6 +237,7 @@ def node_at_skill(seed, key, x, y):
 class Game:
     streak = streak_t = pact_extra = last_dmg = fcount = fscrap = 0
     flag_reset = _boom = phoenix = False
+    fx = None  # the native front end sets this to a list and drains it each frame
     extra_tags = frozenset()
     ms = {}
     cur = None
@@ -846,6 +847,8 @@ class Game:
             if dmg <= 0:
                 e['awake'] = True
                 self.say(f'{src}{e["name"]} shield absorbs {ab}')
+                if self.fx is not None:
+                    self.fx.append(('absorb', e))
                 return 0
         self.last_dmg = dmg
         e['hp'] -= dmg
@@ -858,6 +861,8 @@ class Game:
         if lc:
             self.hp = min(self.st('hp'), self.hp + max(0, int(dmg * lc / 100)))
         self.say(f'{src}{e["name"]} -{dmg}{"!" if crit else ""}' + (' (dies)' if e['hp'] <= 0 else ''))
+        if self.fx is not None:
+            self.fx.append(('dmg', e, dmg, crit))
         if e['hp'] > 0 and self.ms:
             if self.ms.get('sk_burn'):
                 e['dots'].append((max(1, int(dmg * self.ms['sk_burn'] / 100)), 3))
@@ -873,6 +878,8 @@ class Game:
     def kill(self, e):
         if e in self.en:
             self.en.remove(e)
+        if self.fx is not None:
+            self.fx.append(('die', e))
         if self.cur:
             self.train(self.cur, 2)
         pw = self.powers()
@@ -1299,6 +1306,8 @@ class Game:
         if 'draining' in e['aff']:
             self.mana = max(0, self.mana - max(1, self.st('mana') // 20))
         self.say(f'{e["name"]} hits you -{d}')
+        if self.fx is not None:
+            self.fx.append(('hurt', d))
 
     def enemy_act(self, e):
         if e['boss']:
