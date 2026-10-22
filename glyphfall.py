@@ -2001,10 +2001,19 @@ def run(win):
     for i, c in enumerate([curses.COLOR_WHITE, curses.COLOR_RED, curses.COLOR_GREEN, curses.COLOR_YELLOW, curses.COLOR_BLUE,
                            curses.COLOR_MAGENTA, curses.COLOR_CYAN], 1):
         curses.init_pair(i, c, -1)
-    win.keypad(True)
+    # the phone's nav bar overlays the bottom rows; GF_MARGIN (set by glyphfall-touch) keeps the UI above it
+    scr, margin = win, int(os.environ.get('GF_MARGIN', '0'))
+
+    def mkwin():
+        h, w = scr.getmaxyx()
+        ww = scr.derwin(max(12, h - margin), w, 0, 0) if margin else scr
+        ww.keypad(True)
+        ww.timeout(20000)
+        return ww
+
+    win = mkwin()
     curses.mouseinterval(0)
     curses.mousemask(curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED | curses.BUTTON1_RELEASED)
-    win.timeout(20000)
     try:
         g = Game.load() if os.path.exists(SAVE) else Game()
     except Exception:
@@ -2020,6 +2029,9 @@ def run(win):
         if left <= 600 and not warned:
             warned = True
             g.say('10 minutes left. Find a good stopping spot.')
+        if margin and win.getmaxyx() != (max(12, scr.getmaxyx()[0] - margin), scr.getmaxyx()[1]):
+            scr.clear()
+            win = mkwin()
         touch = '--keys' not in sys.argv and win.getmaxyx()[0] >= 16 and (win.getmaxyx()[1] >= 80 or '--touch' in sys.argv)
         draw(win, g, btns, touch)
         if left <= 0:

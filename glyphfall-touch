@@ -6,7 +6,7 @@ restore() { swaymsg output "$OUT" transform normal >/dev/null; }
 trap restore EXIT INT TERM HUP
 swaymsg output "$OUT" transform 90 >/dev/null
 sleep 0.5
-foot --app-id glyphfall -o "font=Roboto Mono:size=${GF_FONT:-9}" -o "pad=0x0" python3 "$HOME/projects/glyphfall/glyphfall.py" "$@" &
+GF_MARGIN=${GF_MARGIN:-2} foot --app-id glyphfall -o "font=Roboto Mono:size=${GF_FONT:-9}" -o "pad=0x0" python3 "$HOME/projects/glyphfall/glyphfall.py" "$@" &
 FP=$!
 sleep 1
 swaymsg '[app_id="glyphfall"] fullscreen enable' >/dev/null
