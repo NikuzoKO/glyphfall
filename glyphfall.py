@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """glyphfall: terminal ARPG. Classless, skill-swap builds, affix loot, infinite passive grid."""
-import curses, locale, random, zlib
+import curses, locale, random, zlib, json, os, sys, time, signal
+
+SAVE = os.path.expanduser('~/.local/share/glyphfall/save.json')
 
 W, H = 80, 40
 RARITY = ['normal', 'magic', 'rare', 'legend']
@@ -38,6 +40,12 @@ RARE_B = ['Bite', 'Coil', 'Brand', 'Edge', 'Veil', 'Grip', 'Song', 'Maw']
 ENEMIES = [('Rat', 'r', 8, 3, 4, 1, ''), ('Skeleton', 's', 14, 5, 7, 1, ''), ('Imp', 'i', 10, 4, 8, 2, 'ranged'),
            ('Ghoul', 'g', 26, 7, 12, 3, ''), ('Wraith', 'W', 18, 8, 16, 4, 'fast'), ('Cultist', 'c', 22, 6, 14, 5, 'ranged'),
            ('Golem', 'G', 60, 11, 30, 7, '')]
+
+
+def tuple_aff(it):
+    if 'aff' in it:
+        it['aff'] = [tuple(a) for a in it['aff']]
+    return it
 
 
 def node_at(seed, x, y):
@@ -81,6 +89,46 @@ class Game:
         self.new_level()
         self.hp, self.mana = self.st('hp'), self.st('mana')
 
+    # ---- persistence (current level is regenerated from seed+depth on load)
+    def save(self):
+        d = dict(seed=self.seed, depth=self.depth, lvl=self.lvl, xp=self.xp, points=self.points, alloc=sorted(self.alloc),
+                 equip=self.equip, pack=self.pack, known=self.known, slots=self.slots, hp=self.hp, mana=self.mana, turn=self.turn,
+                 best=getattr(self, 'best', self.depth), deaths=getattr(self, 'deaths', 0))
+        os.makedirs(os.path.dirname(SAVE), exist_ok=True)
+        with open(SAVE + '.tmp', 'w') as f:
+            json.dump(d, f)
+        os.replace(SAVE + '.tmp', SAVE)
+
+    @classmethod
+    def load(cls):
+        d = json.load(open(SAVE))
+        g = cls.__new__(cls)
+        g.seed, g.lvl, g.xp, g.points = d['seed'], d['lvl'], d['xp'], d['points']
+        g.rng = random.Random(g.seed + d['turn'])
+        g.alloc = {tuple(p) for p in d['alloc']}
+        g.equip, g.pack, g.known, g.slots = d['equip'], [tuple_aff(i) for i in d['pack']], d['known'], d['slots']
+        for k, it in g.equip.items():
+            if it:
+                tuple_aff(it)
+        g.cd, g.buffs, g.log = {}, {}, []
+        g.face, g.turn, g.dead = (1, 0), d['turn'], False
+        g.depth = d['depth'] - 1
+        g.best, g.deaths = d.get('best', d['depth']), d.get('deaths', 0)
+        g.new_level()
+        g.hp, g.mana = min(d['hp'], g.st('hp')), min(d['mana'], g.st('mana'))
+        g.say('Welcome back.')
+        return g
+
+    def respawn(self):
+        # death is a setback, not a wipe: lose 1 depth and a quarter of the xp bar, keep everything else
+        self.deaths = getattr(self, 'deaths', 0) + 1
+        self.xp = int(self.xp * 0.75)
+        self.depth = max(0, self.depth - 2)
+        self.dead = False
+        self.new_level()
+        self.hp, self.mana = self.st('hp'), self.st('mana')
+        self.say('You wake at the entrance. Depth lost, gear kept.')
+
     # ---- stats
     def stats(self):
         s = {}
@@ -107,6 +155,7 @@ class Game:
     # ---- level gen
     def new_level(self):
         self.depth += 1
+        self.best = max(getattr(self, 'best', 0), self.depth)
         r = random.Random(f'{self.seed}:{self.depth}')
         g = [['#'] * W for _ in range(H)]
         rooms = []
@@ -149,14 +198,16 @@ class Game:
 
     def spawn(self, x, y, r, boss=False):
         pool = [e for e in ENEMIES if e[5] <= self.depth] or ENEMIES[:1]
-        n, gl, hp, dm, xp, _, fl = r.choice(pool[-4:])
-        sc = 1 + 0.22 * (self.depth - 1)
+        n, gl, hp, dm, xp, _, fl = r.choice(pool[-5:])
+        tier = (self.depth - 1) // 10
+        sc = (1 + 0.22 * (self.depth - 1)) * (1.5 ** tier)
+        pre = ['', 'Elder ', 'Ancient ', 'Primal ', 'Eternal '][min(tier, 4)] + ('Mythic ' * max(0, tier - 4))
         champ = r.random() < 0.12
         if boss:
             n, gl, hp, dm, xp, fl, champ = 'Warden', 'Ω', hp * 5, dm * 2, xp * 8, '', False
         if champ:
             hp, dm, xp, gl = hp * 2, int(dm * 1.5), xp * 3, gl.upper()
-        e = dict(name=('Champion ' if champ else '') + n, gl=gl, hp=int(hp * sc), mhp=int(hp * sc), dmg=max(1, int(dm * sc)), xp=int(xp * sc),
+        e = dict(name=pre + ('Champion ' if champ else '') + n, gl=gl, hp=int(hp * sc), mhp=int(hp * sc), dmg=max(1, int(dm * sc)), xp=int(xp * sc),
                  x=x, y=y, fl=fl, slow=0, dots=[], champ=champ or boss, boss=boss, awake=False)
         self.en.append(e)
         return e
@@ -181,7 +232,7 @@ class Game:
         slot = r.choice(['weapon', 'armor', 'charm'])
         n = {'normal': 0, 'magic': r.randint(1, 2), 'rare': r.randint(3, 4), 'legend': r.randint(5, 6)}[rar]
         aff, used = [], set()
-        sc = 1 + 0.08 * ilvl
+        sc = (1 + 0.08 * ilvl) * (1.5 ** ((ilvl - 1) // 10))
         if slot == 'weapon':
             aff.append(('weapon', int((2 + r.randint(0, 2)) * sc)))
         if slot == 'armor':
@@ -590,6 +641,7 @@ def draw(win, g):
     put(win, 0, w - 18, f'Lv{g.lvl} ▼D{g.depth}' + (f' ✚{g.points}' if g.points else ''), cp(4, True))
     xpn = int(18 * g.lvl ** 1.5)
     put(win, 1, w - 18, f'xp {g.xp}/{xpn}', curses.A_DIM)
+    put(win, 2, w - 18, getattr(g, 'clock', ''), curses.A_DIM)
     for i, m in enumerate(g.log[-3:]):
         put(win, h - 5 + i, 0, m, curses.A_DIM if i < 2 else 0)
     sb = ''
@@ -728,12 +780,42 @@ def run(win):
                            curses.COLOR_MAGENTA, curses.COLOR_CYAN], 1):
         curses.init_pair(i, c, -1)
     win.keypad(True)
-    g = Game()
+    win.timeout(20000)
+    try:
+        g = Game.load() if os.path.exists(SAVE) else Game()
+    except Exception:
+        g = Game()
+    mins = next((int(sys.argv[i + 1]) for i, a in enumerate(sys.argv) if a == '--mins'), 120)
+    end = time.time() + mins * 60
+    warned = False
+    signal.signal(signal.SIGHUP, lambda *a: (g.save(), sys.exit(0)))
     while True:
+        left = end - time.time()
+        g.clock = f'{max(0, int(left // 60))}m left'
+        if left <= 600 and not warned:
+            warned = True
+            g.say('10 minutes left. Find a good stopping spot.')
         draw(win, g)
+        if left <= 0:
+            g.save()
+            win.erase()
+            put(win, 2, 2, 'Time. Saved.', cp(4, True))
+            put(win, 4, 2, 'Next: bus stop -> work,')
+            put(win, 5, 2, 'or lunch at grandmother\'s.')
+            put(win, 7, 2, 'any key: close   C: keep playing 10m', curses.A_DIM)
+            win.refresh()
+            win.timeout(-1)
+            if win.getch() != ord('C'):
+                return
+            win.timeout(20000)
+            end, warned = time.time() + 600, True
+            continue
         c = win.getch()
+        if c == -1:
+            continue
         used = False
         if c == ord('Q'):
+            g.save()
             return
         if c in KEYS:
             used = g.step(*KEYS[c])
@@ -751,14 +833,11 @@ def run(win):
             menu_tree(win, g)
         if used:
             g.end_turn()
+            if g.turn % 40 == 0 or c in (ord('>'), 10, 13):
+                g.save()
         if g.dead:
-            win.erase()
-            put(win, 2, 2, f'YOU DIED on depth {g.depth}, level {g.lvl}.', cp(2, True))
-            put(win, 4, 2, 'any key: new run   Q: quit')
-            win.refresh()
-            if win.getch() == ord('Q'):
-                return
-            g = Game()
+            g.respawn()
+            g.save()
 
 
 if __name__ == '__main__':
