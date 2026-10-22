@@ -5,8 +5,8 @@ import curses, locale, random, zlib, json, os, sys, time, signal
 SAVE = os.path.expanduser('~/.local/share/glyphfall/save.json')
 
 W, H = 80, 40
-RARITY = ['normal', 'magic', 'rare', 'legend']
-RCOL = {'normal': 1, 'magic': 7, 'rare': 4, 'legend': 6}
+RARITY = ['normal', 'magic', 'rare', 'legend', 'mythic', 'unique']
+RCOL = {'normal': 1, 'magic': 7, 'rare': 4, 'legend': 6, 'mythic': 2, 'unique': 3}
 TAGS = ['fire', 'cold', 'lightning', 'phys', 'poison', 'necro', 'projectile', 'aoe', 'melee', 'chain', 'movement']
 
 # ---- skills: no classes, just a pool. tags feed the *_pct stats from gear and tree.
@@ -40,6 +40,67 @@ RARE_B = ['Bite', 'Coil', 'Brand', 'Edge', 'Veil', 'Grip', 'Song', 'Maw']
 ENEMIES = [('Rat', 'r', 8, 3, 4, 1, ''), ('Skeleton', 's', 14, 5, 7, 1, ''), ('Imp', 'i', 10, 4, 8, 2, 'ranged'),
            ('Ghoul', 'g', 26, 7, 12, 3, ''), ('Wraith', 'W', 18, 8, 16, 4, 'fast'), ('Cultist', 'c', 22, 6, 14, 5, 'ranged'),
            ('Golem', 'G', 60, 11, 30, 7, '')]
+
+
+# ---- build-defining powers. Legendary = rank 1, Mythic = same power at rank 2 (numbers x2) on stronger gear.
+LEGEND_POWERS = ['cinder_heart', 'storm_mantle', 'frost_tyrant', 'plague_doctor', 'echo_ring', 'whirl_boots', 'overflow_stone',
+                 'last_stand', 'prime_charm', 'blood_chalice', 'glass_idol']
+POWER_TEXT = {
+    'cinder_heart': ('Cinder Heart', lambda r: f'Fire skills explode on kill for {30 * r}% of the killing blow'),
+    'storm_mantle': ('Storm Mantle', lambda r: f'Chain skills arc {2 * r} more times'),
+    'frost_tyrant': ('Frost Tyrant', lambda r: f'Cold skills slow {2 + r} turns; slowed enemies take +{25 * r}% damage'),
+    'plague_doctor': ('Plague Doctor', lambda r: f'Poison skills last {2 * r} longer and spread when the victim dies'),
+    'echo_ring': ('Echo Ring', lambda r: f'All skills have +{15 * r}% chance to cast twice'),
+    'whirl_boots': ('Whirling Treads', lambda r: f'Melee skills reach {r} tile{"s" if r > 1 else ""} further'),
+    'overflow_stone': ('Overflow Stone', lambda r: f'+{40 * r}% skill damage while mana is above 90%'),
+    'last_stand': ('Last Stand', lambda r: f'Below 35% life: +{60 * r}% skill damage, +{10 * r}% leech'),
+    'prime_charm': ('Prime Charm', lambda r: f'Skill in slot 1: +{40 * r}% damage, {2 * r} mana cheaper'),
+    'blood_chalice': ('Blood Chalice', lambda r: f'Each kill restores {2 * r} mana'),
+    'glass_idol': ('Glass Idol', lambda r: f'+{40 * r}% more damage, {-25 * r}% max life'),
+    # unique-only
+    'skill_fusion': ('Prismatic Fusion', lambda r: 'Each skill also counts as having the tags of the skill in the next slot'),
+    'double_slot': ('Twinned Casting', lambda r: 'Casting slot 1 has 40% to also cast slot 2 for free'),
+    'mana_to_life': ('Soulbinding', lambda r: 'Missing mana is paid with life, 2 life per mana'),
+    'kill_streak': ('Reaping', lambda r: 'Each kill within 6 turns: +10% skill damage, up to 10 stacks'),
+    'find_idol': ('Gambler', lambda r: '+100% item find'),
+    'deathless': ('Rebirth', lambda r: 'Once per level, lethal damage heals you to 50% and burns everything near'),
+    'inferno': ('Wyrmfire', lambda r: 'Fire skills have no cooldown and always burn for 60%'),
+}
+UNIQUES = [
+    dict(name='Prismatic Idol', slot='charm', power='skill_fusion', base={'crit': 6, 'mana': 15}),
+    dict(name='Twinned Blade', slot='weapon', power='double_slot', base={'weapon': 6, 'dmg_pct': 12}),
+    dict(name='Soulbinder Robe', slot='armor', power='mana_to_life', base={'armor': 8, 'mana': 25, 'leech': 3}),
+    dict(name="Reaper's Tally", slot='charm', power='kill_streak', base={'crit': 4, 'weapon': 2}),
+    dict(name="Gambler's Fang", slot='charm', power='find_idol', base={'dmg_pct': 8}),
+    dict(name='Phoenix Coil', slot='armor', power='deathless', base={'hp': 30, 'armor': 10, 'regen': 2}),
+    dict(name='Wyrmfang', slot='weapon', power='inferno', base={'weapon': 5, 'fire_pct': 35}),
+]
+
+# ---- skill-specific mastery nodes: {skill: {'notable': [(name, stats)], 'key': [(name, stats)]}}
+SPECIALS = {
+    'whirlwind': dict(notable=[('Reaping Heal', {'ww_heal': 3}), ('Open Wounds', {'ww_bleed': 35})], key=[('Cyclone', {'ww_twice': 1, 'sk_cost': -4})]),
+    'fireball': dict(notable=[('Wildfire', {'fb_explode': 50}), ('Twin Fire', {'fb_twin': 1})], key=[('Meteor', {'fb_splash': 1, 'sk_dmg': 60, 'sk_cost': -5})]),
+    'frost_nova': dict(notable=[('Shatter', {'shatter': 60}), ('Cold Snap', {'fn_mana': 2})], key=[('Absolute Zero', {'fn_pulse': 1, 'sk_cost': -3})]),
+    'blink': dict(notable=[('Phantom Trail', {'bl_trail': 60}), ('Fleet Foot', {'bl_reset': 1})], key=[('Rift Walker', {'bl_range': 4, 'sk_cost': -3})]),
+    'chain_lightning': dict(notable=[('Ball Lightning', {'cl_ramp': 1}), ('Static Charge', {'cl_slow': 2})], key=[('Storm Rod', {'cl_all': 1, 'sk_cost': -4})]),
+    'bone_spear': dict(notable=[('Marrow Rend', {'bs_exec': 25}), ('Barrage', {'bs_fan': 2})], key=[('Skewer', {'bs_ramp': 25, 'sk_cost': -3})]),
+    'poison_cloud': dict(notable=[('Plague', {'pc_spread': 1}), ('Lingering Haze', {'pc_long': 3})], key=[('Miasma', {'sk_radius': 2, 'sk_dmg': 40, 'sk_cost': -5})]),
+    'soul_siphon': dict(notable=[('Soul Harvest', {'ss_mana': 3}), ('Twin Siphon', {'ss_twin': 1})], key=[('Lich Touch', {'ss_heal': 50, 'sk_cost': -2})]),
+    'blood_pact': dict(notable=[('Thick Blood', {'bp_cheap': 1}), ('Lingering Oath', {'bp_long': 4})], key=[('Crimson Tide', {'bp_power': 50, 'sk_cost': -2})]),
+}
+ELABEL = {'more_dmg': '+{}% More Damage', 'hp_mult': '{:+}% Max Life', 'sk_dmg': '{:+}% skill damage', 'sk_cost': '{:+} mana discount',
+          'sk_cd': '-{} cooldown', 'sk_crit': '+{}% skill crit', 'sk_leech': '+{}% skill leech', 'sk_echo': '{}% chance to cast twice',
+          'sk_burn': 'hits burn for {}% over 3 turns', 'sk_slow': 'hits slow for {} turns', 'sk_range': '+{} range',
+          'sk_radius': '+{} radius', 'sk_chain': '+{} chain/targets', 'ww_heal': 'heal {}% max life per enemy hit',
+          'ww_bleed': 'bleed for {}% over 4 turns', 'ww_twice': 'hits every enemy twice', 'fb_explode': 'kills explode for {}% damage',
+          'fb_twin': 'also hits a second target (70%)', 'fb_splash': 'splash around the target (60%)', 'shatter': 'slowed enemies take +{}% damage',
+          'fn_mana': '+{} mana per enemy hit', 'fn_pulse': 'second pulse, wider (60%)', 'bl_trail': 'damages enemies along the path ({}%)',
+          'bl_reset': 'kills reset the cooldown', 'bl_range': '+{} blink distance', 'cl_ramp': 'each arc hits 20% harder, not softer',
+          'cl_slow': 'arcs slow for {} turns', 'cl_all': 'arcs through every enemy nearby', 'bs_exec': 'executes enemies below {}% life',
+          'bs_fan': '+{} extra spears at other targets', 'bs_ramp': '+{}% damage per enemy pierced', 'pc_spread': 'poison spreads when victims die',
+          'pc_long': 'poison lasts {} longer', 'spread': 'poison spreads when victims die', 'dur': 'poison lasts {} longer',
+          'ss_mana': '+{} mana per cast', 'ss_twin': 'also drains a second target', 'ss_heal': '+{}% drain healing',
+          'bp_cheap': 'costs half the life', 'bp_long': 'lasts {} more turns', 'bp_power': 'buff +{}% stronger'}
 
 
 def tuple_aff(it):
@@ -78,12 +139,19 @@ def node_at_skill(seed, key, x, y):
     r = random.Random(zlib.crc32(f'{seed}:{key}:{x}:{y}'.encode()))
     sc = 1 + (abs(x) + abs(y)) * 0.05
     roll = r.random()
+    sp = SPECIALS.get(key)
     if roll < 0.05:
+        if sp and r.random() < 0.6:
+            k = r.choice(sp['key'])
+            return dict(kind='key', name=k[0], stats=k[1])
         k = r.choice([('Overload', {'sk_dmg': 80, 'sk_cost': -4}), ('Efficiency', {'sk_cost': 4, 'sk_dmg': -15}),
                       ('Echo Chamber', {'sk_echo': 35, 'sk_dmg': -15}), ('Bloodthirst', {'sk_leech': 18}),
                       ('Executioner', {'sk_crit': 25, 'sk_dmg': -10})])
         return dict(kind='key', name=k[0], stats=k[1])
     if roll < 0.22:
+        if sp and r.random() < 0.45:
+            k = r.choice(sp['notable'])
+            return dict(kind='notable', name=k[0], stats=k[1])
         opts = [('sk_dmg', int(22 * sc), 'Power'), ('sk_echo', int(12 * sc), 'Echo'), ('sk_burn', int(25 * sc), 'Searing'),
                 ('sk_slow', 2, 'Chill'), ('sk_leech', int(6 * sc), 'Thirst')]
         if 'aoe' in sk['tags']:
@@ -102,6 +170,12 @@ def node_at_skill(seed, key, x, y):
 
 
 class Game:
+    streak = streak_t = pact_extra = last_dmg = 0
+    flag_reset = _boom = phoenix = False
+    extra_tags = frozenset()
+    ms = {}
+    cur = None
+
     def __init__(self, seed=None):
         self.seed = seed or random.randrange(1 << 30)
         self.rng = random.Random(self.seed)
@@ -185,9 +259,6 @@ class Game:
             m['points'] += 1
             self.say(f'{SKILLS[key]["name"]} mastery {m["lvl"]}! +1 point (Skl > Master)')
 
-    def eff_cost(self, key):
-        return max(0, SKILLS[key]['cost'] - self.mstats(key).get('sk_cost', 0))
-
     # ---- stats
     def stats(self):
         s = {}
@@ -199,6 +270,11 @@ class Game:
                 add(dict(it['aff']))
         for p in self.alloc:
             add(node_at(self.seed, *p)['stats'])
+        pw = self.powers()
+        if 'glass_idol' in pw:
+            add({'more_dmg': 40 * pw['glass_idol'], 'hp_mult': -25 * pw['glass_idol']})
+        if 'find_idol' in pw:
+            add({'find': 100})
         s['hp'] = int((60 + 4 * (self.lvl - 1) + s.get('hp', 0)) * (1 + s.get('hp_mult', 0) / 100))
         s['mana'] = 30 + 2 * (self.lvl - 1) + s.get('mana', 0)
         s['weapon'] = 3 + s.get('weapon', 0)
@@ -214,6 +290,7 @@ class Game:
     # ---- level gen
     def new_level(self):
         self.depth += 1
+        self.phoenix = False
         self.best = max(getattr(self, 'best', 0), self.depth)
         r = random.Random(f'{self.seed}:{self.depth}')
         g = [['#'] * W for _ in range(H)]
@@ -287,11 +364,11 @@ class Game:
     def make_item(self, ilvl, bonus, find=1):
         r = self.rng
         x = r.random() / (find * (1 + bonus * 0.4)) ** 0.5
-        rar = 'legend' if x < 0.01 else 'rare' if x < 0.10 else 'magic' if x < 0.40 else 'normal'
+        rar = 'mythic' if x < 0.0015 and ilvl >= 6 else 'legend' if x < 0.012 else 'rare' if x < 0.10 else 'magic' if x < 0.40 else 'normal'
         slot = r.choice(['weapon', 'armor', 'charm'])
-        n = {'normal': 0, 'magic': r.randint(1, 2), 'rare': r.randint(3, 4), 'legend': r.randint(5, 6)}[rar]
+        n = {'normal': 0, 'magic': r.randint(1, 2), 'rare': r.randint(3, 4), 'legend': r.randint(5, 6), 'mythic': r.randint(6, 7)}[rar]
         aff, used = [], set()
-        sc = (1 + 0.08 * ilvl) * (1.5 ** ((ilvl - 1) // 10))
+        sc = (1 + 0.08 * ilvl) * (1.5 ** ((ilvl - 1) // 10)) * (1.4 if rar == 'mythic' else 1)
         if slot == 'weapon':
             aff.append(('weapon', int((2 + r.randint(0, 2)) * sc)))
         if slot == 'armor':
@@ -304,17 +381,29 @@ class Game:
             aff.append((a[0], max(1, int(r.uniform(a[2], a[3]) * sc))))
         base = r.choice(BASES[slot])
         name = base if rar == 'normal' else f'{r.choice(PRE)} {base}' if rar == 'magic' else \
-            f'{r.choice(RARE_A)}{r.choice(RARE_B).lower()} {base}' if rar == 'rare' else f'★ {r.choice(RARE_A)}{r.choice(RARE_B).lower()}, the {base}'
-        return dict(slot=slot, rarity=rar, name=name, aff=aff, ilvl=ilvl)
+            f'{r.choice(RARE_A)}{r.choice(RARE_B).lower()} {base}' if rar == 'rare' else \
+            f'★ {r.choice(RARE_A)}{r.choice(RARE_B).lower()}, the {base}' if rar == 'legend' else f'☀ Mythic {r.choice(RARE_A)}{r.choice(RARE_B).lower()} {base}'
+        it = dict(slot=slot, rarity=rar, name=name, aff=aff, ilvl=ilvl)
+        if rar in ('legend', 'mythic'):
+            it['power'], it['rank'] = r.choice(LEGEND_POWERS), 2 if rar == 'mythic' else 1
+        return it
+
+    def make_unique(self):
+        have = {i['name'] for i in self.pack} | {i['name'] for i in self.equip.values() if i}
+        u = self.rng.choice([u for u in UNIQUES if u['name'] not in have] or UNIQUES)
+        sc = (1 + 0.08 * self.depth) * (1.5 ** ((self.depth - 1) // 10))
+        return dict(slot=u['slot'], rarity='unique', name=u['name'], aff=[(k, max(1, int(v * sc))) for k, v in u['base'].items()],
+                    ilvl=self.depth, power=u['power'], rank=1)
+
+    def drop_unique(self, x, y):
+        self.items.setdefault((x, y), []).append(self.make_unique())
+        self.say('A UNIQUE drops!')
 
     def aff_text(self, stat, v):
         for a in AFFIXES:
             if a[0] == stat:
                 return a[1].format(v)
-        return {'more_dmg': '+{}% More Damage', 'hp_mult': '{:+}% Max Life', 'sk_dmg': '{:+}% skill damage', 'sk_cost': '{:+} mana discount',
-                'sk_cd': '-{} cooldown', 'sk_crit': '+{}% skill crit', 'sk_leech': '+{}% skill leech', 'sk_echo': '{}% chance to cast twice',
-                'sk_burn': 'hits burn for {}% over 3 turns', 'sk_slow': 'hits slow for {} turns', 'sk_range': '+{} range',
-                'sk_radius': '+{} radius', 'sk_chain': '+{} chain/targets'}.get(stat, stat + ' {}').format(v)
+        return ELABEL.get(stat, stat + ' {}').format(v)
 
     def pickup(self):
         for it in self.items.pop((self.px, self.py), []):
@@ -365,10 +454,11 @@ class Game:
     # ---- combat
     def calc(self, base, tags, melee_weapon=False):
         s = self.stats()
+        tags = set(tags) | self.extra_tags
         d = base + (s['weapon'] * 0.6 if melee_weapon else 0)
         pct = s.get('dmg_pct', 0) + sum(s.get(t + '_pct', 0) for t in tags) + self.ms.get('sk_dmg', 0)
         if 'pact' in self.buffs:
-            pct += 50
+            pct += 50 + self.pact_extra
         d *= max(0.1, 1 + pct / 100) * (1 + s.get('more_dmg', 0) / 100)
         crit = self.rng.random() * 100 < 5 + s.get('crit', 0) + self.ms.get('sk_crit', 0)
         if crit:
@@ -378,6 +468,9 @@ class Game:
     def hit(self, e, dmg, crit=False, src=''):
         if e['hp'] <= 0:
             return 0
+        if e['slow'] > 0 and self.ms.get('shatter'):
+            dmg = int(dmg * (1 + self.ms['shatter'] / 100))
+        self.last_dmg = dmg
         e['hp'] -= dmg
         e['awake'] = True
         lc = self.st('leech') + self.ms.get('sk_leech', 0)
@@ -393,12 +486,36 @@ class Game:
             self.kill(e)
         return dmg
 
+    def near(self, a, b, r2=5):
+        return (a['x'] - b['x']) ** 2 + (a['y'] - b['y']) ** 2 <= r2
+
     def kill(self, e):
         if e in self.en:
             self.en.remove(e)
         if self.cur:
             self.train(self.cur, 2)
+        pw = self.powers()
+        if 'blood_chalice' in pw:
+            self.mana = min(self.st('mana'), self.mana + 2 * pw['blood_chalice'])
+        if 'kill_streak' in pw:
+            self.streak, self.streak_t = min(10, self.streak + 1), 6
+        if self.ms.get('bl_reset'):
+            self.flag_reset = True
+        if self.ms.get('fb_explode') and not self._boom:
+            self._boom = True
+            try:
+                dmg = max(1, int(self.last_dmg * self.ms['fb_explode'] / 100))
+                for o in [o for o in self.en if self.near(o, e)]:
+                    self.hit(o, dmg, False, 'Blast: ')
+            finally:
+                self._boom = False
+        if e.get('spread') and e['dots']:
+            for o in [o for o in self.en if self.near(o, e)]:
+                o['dots'] += list(e['dots'])
+                o['spread'], o['awake'] = True, True
         self.gain_xp(e['xp'])
+        if e['boss'] and self.rng.random() < 0.6 or e['champ'] and self.rng.random() < 0.03 or self.rng.random() < 0.003:
+            self.drop_unique(e['x'], e['y'])
         if e['champ'] or self.rng.random() < 0.28:
             for _ in range(3 if e['boss'] else 1):
                 self.drop(e['x'], e['y'], 2 if e['champ'] else 0)
@@ -412,50 +529,121 @@ class Game:
             self.hp = min(self.st('hp'), self.hp + self.st('hp') // 3)
             self.say(f'LEVEL {self.lvl}! +1 passive point (T)')
 
-    def nearest(self, rng):
+    def nearest(self, rng, skip=()):
         rng += self.ms.get('sk_range', 0)
-        c = [e for e in self.en if (e['x'], e['y']) in self.vis and (e['x'] - self.px) ** 2 + (e['y'] - self.py) ** 2 <= rng * rng]
+        c = [e for e in self.en if e not in skip and (e['x'], e['y']) in self.vis and (e['x'] - self.px) ** 2 + (e['y'] - self.py) ** 2 <= rng * rng]
         return min(c, key=lambda e: (e['x'] - self.px) ** 2 + (e['y'] - self.py) ** 2) if c else None
 
     def adjacent(self):
         return [e for e in self.en if max(abs(e['x'] - self.px), abs(e['y'] - self.py)) == 1]
 
-    def cast(self, idx):
+    # ---- powers (legendary / mythic / unique) feed the same mods the mastery grids use
+    def powers(self):
+        out = {}
+        for it in self.equip.values():
+            if it and it.get('power'):
+                out[it['power']] = out.get(it['power'], 0) + it.get('rank', 1)
+        return out
+
+    def cast_mods(self, key, idx):
+        tags = SKILLS[key]['tags']
+        m = dict(self.mstats(key))
+        add = lambda k, v: m.__setitem__(k, m.get(k, 0) + v)
+        for p, r in self.powers().items():
+            if p == 'cinder_heart' and 'fire' in tags:
+                add('fb_explode', 30 * r)
+            elif p == 'storm_mantle' and 'chain' in tags:
+                add('sk_chain', 2 * r)
+            elif p == 'frost_tyrant' and 'cold' in tags:
+                m['sk_slow'] = max(m.get('sk_slow', 0), 2 + r)
+                add('shatter', 25 * r)
+            elif p == 'plague_doctor' and 'poison' in tags:
+                m['spread'] = 1
+                add('dur', 2 * r)
+            elif p == 'echo_ring':
+                add('sk_echo', 15 * r)
+            elif p == 'whirl_boots' and 'melee' in tags:
+                add('sk_radius', r)
+            elif p == 'overflow_stone' and self.mana >= 0.9 * self.st('mana'):
+                add('sk_dmg', 40 * r)
+            elif p == 'last_stand' and self.hp < 0.35 * self.st('hp'):
+                add('sk_dmg', 60 * r)
+                add('sk_leech', 10 * r)
+            elif p == 'prime_charm' and idx == 0:
+                add('sk_dmg', 40 * r)
+                add('sk_cost', 2 * r)
+            elif p == 'inferno' and 'fire' in tags:
+                add('sk_burn', 60)
+                add('sk_cd', 9)
+            elif p == 'kill_streak':
+                add('sk_dmg', 10 * self.streak)
+        return m
+
+    def eff_cost(self, key):
+        idx = self.slots.index(key) if key in self.slots else -1
+        return max(0, SKILLS[key]['cost'] - self.cast_mods(key, idx).get('sk_cost', 0))
+
+    def cast(self, idx, free=False):
         if idx >= len(self.slots) or not self.slots[idx]:
             return False
         key = self.slots[idx]
         sk = SKILLS[key]
-        if self.cd.get(key, 0) > 0:
+        if self.cd.get(key, 0) > 0 and not free:
             self.say(f'{sk["name"]} cooling ({self.cd[key]})')
             return False
-        ms = self.mstats(key)
-        cost = self.eff_cost(key)
+        ms = self.cast_mods(key, idx)
+        pw = self.powers()
+        cost = 0 if free else max(0, sk['cost'] - ms.get('sk_cost', 0))
+        hpcost = 0
         if self.mana < cost:
-            self.say('Not enough mana')
-            return False
-        self.ms, self.cur = ms, key
+            if 'mana_to_life' in pw and self.hp > (cost - self.mana) * 2 + 1:
+                hpcost = (cost - self.mana) * 2
+            else:
+                self.say('Not enough mana')
+                return False
+        self.ms, self.cur, self.flag_reset = ms, key, False
+        self.extra_tags = set(SKILLS[self.slots[(idx + 1) % len(self.slots)]]['tags']) if 'skill_fusion' in pw else set()
+        ok = False
         try:
             ok = getattr(self, 'sk_' + key)(sk)
             if ok:
-                self.mana -= cost
-                self.cd[key] = max(0, sk['cd'] - ms.get('sk_cd', 0))
+                if hpcost:
+                    self.hp -= hpcost
+                    self.mana = 0
+                else:
+                    self.mana -= cost
+                self.cd[key] = 0 if self.flag_reset else max(0, sk['cd'] - ms.get('sk_cd', 0))
                 self.train(key, 1)
                 if self.rng.random() * 100 < ms.get('sk_echo', 0):
                     self.say('Echo!')
                     getattr(self, 'sk_' + key)(sk)
         finally:
-            self.ms, self.cur = {}, None
+            self.ms, self.cur, self.extra_tags = {}, None, frozenset()
+        if ok and not free and idx == 0 and 'double_slot' in pw and len(self.slots) > 1 and self.rng.random() < 0.4:
+            self.say('Twinned!')
+            self.cast(1, free=True)
         return ok
 
+    def mp(self, k):
+        return self.ms.get(k, 0)
+
     def sk_whirlwind(self, sk):
-        rr = 1 + self.ms.get('sk_radius', 0)
+        rr = 1 + self.mp('sk_radius')
         adj = [e for e in self.en if max(abs(e['x'] - self.px), abs(e['y'] - self.py)) <= rr]
         if not adj:
             self.say('Nothing adjacent')
             return False
-        for e in adj:
-            d, c = self.calc(sk['base'], sk['tags'], True)
-            self.hit(e, d, c, 'Whirl: ')
+        for _ in range(2 if self.mp('ww_twice') else 1):
+            for e in adj:
+                if e not in self.en:
+                    continue
+                d, c = self.calc(sk['base'], sk['tags'], True)
+                self.hit(e, d, c, 'Whirl: ')
+                if self.mp('ww_heal'):
+                    mh = self.st('hp')
+                    self.hp = min(mh, self.hp + max(1, int(mh * self.mp('ww_heal') / 100)))
+                if self.mp('ww_bleed') and e in self.en:
+                    e['dots'].append((max(1, int(d * self.mp('ww_bleed') / 100)), 4))
         return True
 
     def sk_fireball(self, sk):
@@ -467,31 +655,57 @@ class Game:
         self.hit(e, d, c, 'Fireball: ')
         if e in self.en:
             e['dots'].append((max(1, d // 4), 3))
+        if self.mp('fb_twin'):
+            o = self.nearest(sk['rng'], skip=(e,))
+            if o:
+                self.hit(o, int(d * 0.7), False, 'Twin: ')
+        if self.mp('fb_splash'):
+            for o in [o for o in self.en if o is not e and self.near(o, e, 2)]:
+                self.hit(o, int(d * 0.6), False, 'Splash: ')
         return True
 
     def sk_frost_nova(self, sk):
-        hit = [e for e in self.en if (e['x'] - self.px) ** 2 + (e['y'] - self.py) ** 2 <= (2 + self.ms.get('sk_radius', 0)) ** 2 + 1]
+        r2 = (2 + self.mp('sk_radius')) ** 2 + 1
+        hit = [e for e in self.en if (e['x'] - self.px) ** 2 + (e['y'] - self.py) ** 2 <= r2]
         if not hit:
             self.say('Nothing in range')
             return False
         for e in hit:
             d, c = self.calc(sk['base'], sk['tags'])
             self.hit(e, d, c, 'Nova: ')
-            e['slow'] = 3
+            if e in self.en:
+                e['slow'] = max(e['slow'], 3)
+            if self.mp('fn_mana'):
+                self.mana = min(self.st('mana'), self.mana + self.mp('fn_mana'))
+        if self.mp('fn_pulse'):
+            r3 = (3 + self.mp('sk_radius')) ** 2 + 1
+            for e in [e for e in self.en if (e['x'] - self.px) ** 2 + (e['y'] - self.py) ** 2 <= r3]:
+                d, c = self.calc(sk['base'], sk['tags'])
+                self.hit(e, int(d * 0.6), c, 'Pulse: ')
         return True
 
     def sk_blink(self, sk):
         dx, dy = self.face
         x, y = self.px, self.py
-        for _ in range(5):
+        path = []
+        for _ in range(5 + self.mp('bl_range')):
             nx, ny = x + dx, y + dy
             if self.g[ny][nx] == '#' or self.enemy_at(nx, ny):
                 break
             x, y = nx, ny
-        if (x, y) == (self.px, self.py):
+            path.append((x, y))
+        if not path:
             self.say('Blocked')
             return False
+        start = (self.px, self.py)
         self.px, self.py = x, y
+        if self.mp('bl_trail'):
+            done = set()
+            for tx, ty in [start] + path[:-1]:
+                for e in [e for e in self.en if max(abs(e['x'] - tx), abs(e['y'] - ty)) <= 1 and id(e) not in done]:
+                    done.add(id(e))
+                    d, c = self.calc(sk['base'], sk['tags'], True)
+                    self.hit(e, int(d * self.mp('bl_trail') / 100), c, 'Trail: ')
         for e in self.adjacent():
             d, c = self.calc(sk['base'], sk['tags'], True)
             self.hit(e, d, c, 'Blink: ')
@@ -502,15 +716,21 @@ class Game:
         if not e:
             self.say('No target')
             return False
+        allm = self.mp('cl_all')
+        jumps = 40 if allm else 4 + self.mp('sk_chain')
+        factor = 0.92 if allm else 1.2 if self.mp('cl_ramp') else 0.8
+        jr2 = 36 if allm else 16
         done, mult = [], 1.0
-        for _ in range(4 + self.ms.get('sk_chain', 0)):
+        for _ in range(jumps):
             if not e:
                 break
             d, c = self.calc(sk['base'], sk['tags'])
             done.append(e)
             self.hit(e, int(d * mult), c, 'Arc: ')
-            mult *= 0.8
-            cand = [o for o in self.en if o not in done and (o['x'] - e['x']) ** 2 + (o['y'] - e['y']) ** 2 <= 16]
+            if e in self.en and self.mp('cl_slow'):
+                e['slow'] = max(e['slow'], self.mp('cl_slow'))
+            mult *= factor
+            cand = [o for o in self.en if o not in done and self.near(o, e, jr2)]
             e = min(cand, key=lambda o: (o['x'] - e['x']) ** 2 + (o['y'] - e['y']) ** 2) if cand else None
         return True
 
@@ -521,8 +741,8 @@ class Game:
             return False
         dx, dy = t['x'] - self.px, t['y'] - self.py
         n = max(abs(dx), abs(dy))
-        hit = set()
-        for i in range(1, sk['rng'] + 1):
+        hit, k = set(), 0
+        for i in range(1, sk['rng'] + self.mp('sk_range') + 1):
             x, y = self.px + round(dx * i / n), self.py + round(dy * i / n)
             if self.g[y][x] == '#':
                 break
@@ -530,7 +750,19 @@ class Game:
             if e and id(e) not in hit:
                 hit.add(id(e))
                 d, c = self.calc(sk['base'], sk['tags'])
-                self.hit(e, d, c, 'Spear: ')
+                self.hit(e, int(d * (1 + self.mp('bs_ramp') / 100 * k)), c, 'Spear: ')
+                k += 1
+                ex = self.mp('bs_exec')
+                if ex and e in self.en and e['hp'] < e['mhp'] * ex / 100:
+                    self.hit(e, e['hp'], False, 'Rend: ')
+        if self.mp('bs_fan'):
+            rng2 = sk['rng'] + self.mp('sk_range')
+            others = sorted([o for o in self.en if id(o) not in hit and (o['x'], o['y']) in self.vis and
+                             (o['x'] - self.px) ** 2 + (o['y'] - self.py) ** 2 <= rng2 * rng2],
+                            key=lambda o: (o['x'] - self.px) ** 2 + (o['y'] - self.py) ** 2)[:self.mp('bs_fan')]
+            for o in others:
+                d, c = self.calc(sk['base'], sk['tags'])
+                self.hit(o, int(d * 0.8), c, 'Barrage: ')
         return True
 
     def sk_poison_cloud(self, sk):
@@ -538,10 +770,14 @@ class Game:
         if not t:
             self.say('No target')
             return False
-        for e in [e for e in self.en if (e['x'] - t['x']) ** 2 + (e['y'] - t['y']) ** 2 <= (2 + self.ms.get('sk_radius', 0)) ** 2 + 1]:
+        r2 = (2 + self.mp('sk_radius')) ** 2 + 1
+        dur = 5 + self.mp('dur') + self.mp('pc_long')
+        for e in [e for e in self.en if self.near(e, t, r2)]:
             d, _ = self.calc(sk['base'], sk['tags'])
-            e['dots'].append((d, 5))
+            e['dots'].append((d, dur))
             e['awake'] = True
+            if self.mp('spread') or self.mp('pc_spread'):
+                e['spread'] = True
         self.say('Poison cloud blooms')
         return True
 
@@ -551,19 +787,28 @@ class Game:
             self.say('No target')
             return False
         d, c = self.calc(sk['base'], sk['tags'])
+        mh = self.st('hp')
         got = self.hit(e, d, c, 'Siphon: ')
-        self.hp = min(self.st('hp'), self.hp + int(got * 0.4))
+        self.hp = min(mh, self.hp + int(got * (0.4 + self.mp('ss_heal') / 100)))
+        if self.mp('ss_mana'):
+            self.mana = min(self.st('mana'), self.mana + self.mp('ss_mana'))
+        if self.mp('ss_twin'):
+            o = self.nearest(sk['rng'], skip=(e,))
+            if o:
+                got = self.hit(o, int(d * 0.7), False, 'Twin siphon: ')
+                self.hp = min(mh, self.hp + int(got * (0.4 + self.mp('ss_heal') / 100)))
         return True
 
     def sk_blood_pact(self, sk):
-        cost = int(self.st('hp') * 0.12)
+        cost = int(self.st('hp') * (0.06 if self.mp('bp_cheap') else 0.12))
         if self.hp <= cost + 1:
             self.say('Too weak for the pact')
             return False
         self.hp -= cost
         self.mana = min(self.st('mana'), self.mana + 20)
-        self.buffs['pact'] = 6
-        self.say('Blood Pact: +50% damage')
+        self.buffs['pact'] = 6 + self.mp('bp_long')
+        self.pact_extra = self.mp('bp_power')
+        self.say(f'Blood Pact: +{50 + self.pact_extra}% damage')
         return True
 
     # ---- movement & turn
@@ -602,6 +847,10 @@ class Game:
             self.buffs[k] -= 1
             if self.buffs[k] <= 0:
                 del self.buffs[k]
+        if self.streak_t > 0:
+            self.streak_t -= 1
+            if not self.streak_t:
+                self.streak = 0
         self.vision()
         for e in list(self.en):
             if e not in self.en:
@@ -624,6 +873,12 @@ class Game:
                     continue
             for _ in range(2 if 'fast' in e['fl'] else 1):
                 self.enemy_act(e)
+        if self.hp <= 0 and 'deathless' in self.powers() and not self.phoenix:
+            self.phoenix = True
+            self.hp = self.st('hp') // 2
+            self.say('REBIRTH! Flames scour the area.')
+            for o in [o for o in self.en if self.near(o, dict(x=self.px, y=self.py), 13)]:
+                self.hit(o, max(1, self.st('hp') // 2), False, 'Rebirth: ')
         if self.hp <= 0:
             self.dead = True
 
@@ -667,6 +922,35 @@ class Game:
             self.hp = min(self.hp, self.st('hp'))
             return True
         return False
+
+    def untake(self, alloc, p):
+        """Free respec of one node: allowed if everything else stays connected to the origin."""
+        if p == (0, 0) or p not in alloc:
+            return False
+        rest = alloc - {p}
+        seen, todo = {(0, 0)}, [(0, 0)]
+        while todo:
+            x, y = todo.pop()
+            for q in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
+                if q in rest and q not in seen:
+                    seen.add(q)
+                    todo.append(q)
+        if seen != rest:
+            return False
+        alloc.discard(p)
+        return True
+
+    def respec(self, key=None):
+        alloc = self.mas(key)['alloc'] if key else self.alloc
+        n = len(alloc) - 1
+        alloc.clear()
+        alloc.add((0, 0))
+        if key:
+            self.mas(key)['points'] += n
+        else:
+            self.points += n
+            self.hp = min(self.hp, self.st('hp'))
+        return n
 
     def take_skill(self, key, p):
         m = self.mas(key)
@@ -839,6 +1123,10 @@ def item_lines(g, it):
         return [(f'Skill gem: {sk["name"]}', cp(7, True)), (sk['desc'], 0), ('Tags: ' + ' '.join(sorted(sk['tags'])), curses.A_DIM)]
     out = [(it['name'], cp(RCOL[it['rarity']], True)), (f'{it["rarity"]} {it["slot"]} ilvl {it.get("ilvl", 1)}', curses.A_DIM)]
     out += [('  ' + g.aff_text(k, v), 0) for k, v in it['aff']]
+    if it.get('power'):
+        nm, fn = POWER_TEXT[it['power']]
+        out.append((f'{"☀" if it["rarity"] == "mythic" else "★"} {nm}' + (' II' if it.get('rank', 1) > 1 else ''), cp(RCOL[it['rarity']], True)))
+        out.append(('  ' + fn(it.get('rank', 1)), 0))
     return out
 
 
@@ -848,6 +1136,7 @@ def scroll_top(sel, avail, n):
 
 def menu_inv(win, g):
     sel = 0
+    last_tap = None
     while True:
         win.erase()
         h, w = win.getmaxyx()
@@ -872,8 +1161,11 @@ def menu_inv(win, g):
         if isinstance(c, tuple):
             row = c[1] - 5 + top
             if 5 <= c[1] < 5 + avail and 0 <= row < n and c[2] < half:
-                if row == sel and g.pack[sel]['slot'] != 'gem':
-                    g.equip_item(sel)
+                if row == last_tap and g.pack[row]['slot'] != 'gem':
+                    g.equip_item(row)
+                    last_tap = None
+                else:
+                    last_tap = row
                 sel = row
             continue
         if c in (27, ord('q'), ord('i')):
@@ -939,6 +1231,7 @@ def menu_skills(win, g):
 
 def menu_tree(win, g, key=None):
     cx, cy = 0, 0
+    armed = False
     while True:
         win.erase()
         h, w = win.getmaxyx()
@@ -972,11 +1265,28 @@ def menu_tree(win, g, key=None):
                 put(win, sy, sx, ch, a)
         n = nodefn(cx, cy)
         state = 'taken' if (cx, cy) in alloc else 'available' if (cx, cy) in fr else 'unreachable'
-        put(win, h - 6, 0, f'{n["name"]} [{n["kind"]}] {state}', cp(4, True))
+        put(win, h - 6, 0, f'{n["name"]} [{n["kind"]}] {state}' + ('   Reset again to confirm (free)' if armed else ''), cp(4, True))
         put(win, h - 5, 0, ', '.join(g.aff_text(k, v) for k, v in n['stats'].items()))
-        btns = menu_bar(win, [('←', ord('h')), ('↑', ord('k')), ('↓', ord('j')), ('→', ord('l')), ('Take', 10), ('Back', 27)])
+        btns = menu_bar(win, [('←', ord('h')), ('↑', ord('k')), ('↓', ord('j')), ('→', ord('l')), ('Take', 10), ('Untake', ord('x')),
+                              ('Reset' if not armed else 'SURE?', ord('r')), ('Back', 27)])
         win.refresh()
         c = getin(win, btns)
+        if c != ord('r') and c != -1:
+            armed = False
+        if c == ord('r'):
+            if armed:
+                n = g.respec(key)
+                g.say(f'Respec: {n} points refunded')
+            armed = not armed
+            continue
+        if c == ord('x'):
+            if g.untake(alloc, (cx, cy)):
+                if key:
+                    g.mas(key)['points'] += 1
+                else:
+                    g.points += 1
+                    g.hp = min(g.hp, g.st('hp'))
+            continue
         if isinstance(c, tuple):
             ty, tx = c[1], c[2]
             if 1 <= ty < h - 7:
