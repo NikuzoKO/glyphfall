@@ -601,8 +601,15 @@ def cp(n, bold=False):
     return curses.color_pair(n) | (curses.A_BOLD if bold else 0)
 
 
+SHADOW = None  # tests: list of lists mirroring what put() wrote
+
+
 def put(win, y, x, s, a=0):
     h, w = win.getmaxyx()
+    if SHADOW is not None:
+        for i, ch in enumerate(s):
+            if 0 <= y < len(SHADOW) and 0 <= x + i < len(SHADOW[0]):
+                SHADOW[y][x + i] = ch
     if 0 <= y < h and x < w:
         try:
             win.addstr(y, max(0, x), s[:w - x - (1 if y == h - 1 else 0)], a)
@@ -610,52 +617,129 @@ def put(win, y, x, s, a=0):
             pass
 
 
-def draw(win, g):
+# ---- touch widgets: every button is (y, x, h, w, key); a tap becomes that key press
+def box(win, y, x, h, w, lines, a=0):
+    put(win, y, x, '┌' + '─' * (w - 2) + '┐', a)
+    for j in range(1, h - 1):
+        put(win, y + j, x, '│' + ' ' * (w - 2) + '│', a)
+    put(win, y + h - 1, x, '└' + '─' * (w - 2) + '┘', a)
+    top = y + (h - len(lines)) // 2
+    for j, t in enumerate(lines):
+        put(win, top + j, x + max(1, (w - len(t)) // 2), t[:w - 2], a)
+
+
+def button(win, btns, y, x, h, w, lines, key, a=0):
+    box(win, y, x, h, w, lines, a)
+    btns.append((y, x, h, w, key))
+
+
+def hit(btns, my, mx):
+    for y, x, h, w, key in btns:
+        if y <= my < y + h and x <= mx < x + w:
+            return key
+    return None
+
+
+def menu_bar(win, defs):
+    """Bottom row of 3-line buttons for menus. defs = [(label, key)]."""
+    h, w = win.getmaxyx()
+    btns = []
+    bw = w // len(defs)
+    for i, (lab, key) in enumerate(defs):
+        button(win, btns, h - 3, i * bw, 3, bw, [lab], key, curses.A_DIM)
+    return btns
+
+
+def getin(win, btns):
+    """Next key, or ('tap', y, x) for a touch that missed every button. -1 on timeout."""
+    c = win.getch()
+    if c != curses.KEY_MOUSE:
+        return c
+    try:
+        _, mx, my, _, b = curses.getmouse()
+    except curses.error:
+        return -1
+    if not b & (curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED):
+        return -1
+    k = hit(btns, my, mx)
+    return k if k is not None else ('tap', my, mx)
+
+
+PAD = [[('↖', ord('y')), ('↑', ord('k')), ('↗', ord('u'))],
+       [('←', ord('h')), ('·', ord('.')), ('→', ord('l'))],
+       [('↙', ord('b')), ('↓', ord('j')), ('↘', ord('n'))]]
+ACTIONS = [('▼', ord('>')), ('Bag', ord('i')), ('Skl', ord('K')), ('Tre', ord('t'))]
+PANEL = 20
+
+
+def draw(win, g, btns, touch):
     win.erase()
+    btns.clear()
     h, w = win.getmaxyx()
     s = g.stats()
-    mh = h - 6
-    cx0 = min(max(0, g.px - w // 2), max(0, W - w))
+    if touch:
+        mx0, mw, my0, mh = PANEL, w - 2 * PANEL, 2, h - 4
+    else:
+        mx0, mw, my0, mh = 0, w, 2, h - 6
+    cx0 = min(max(0, g.px - mw // 2), max(0, W - mw))
     cy0 = min(max(0, g.py - mh // 2), max(0, H - mh))
+    g.view = (my0, mx0, mh, mw, cy0, cx0)
+    inside = lambda sy, sx: 0 <= sy < mh and 0 <= sx < mw
     for sy in range(mh):
-        for sx in range(min(w - 1, W)):
+        for sx in range(min(mw - 1, W)):
             x, y = cx0 + sx, cy0 + sy
             if not (0 <= x < W and 0 <= y < H) or not g.seen[y][x]:
                 continue
             t, v = g.g[y][x], (x, y) in g.vis
             ch = '▓' if t == '#' else '▼' if t == '>' else '·'
-            col = cp(1) if t == '#' else cp(4, True) if t == '>' else cp(1)
-            put(win, sy + 2, sx, ch, col if v else curses.A_DIM)
+            col = cp(4, True) if t == '>' else cp(1)
+            put(win, sy + my0, sx + mx0, ch, col if v else curses.A_DIM)
     for (x, y), its in g.items.items():
-        if (x, y) in g.vis:
+        if (x, y) in g.vis and inside(y - cy0, x - cx0):
             it = its[-1]
-            put(win, y - cy0 + 2, x - cx0, '◈' if it['slot'] == 'gem' else '◆', cp(RCOL[it['rarity']], True))
+            put(win, y - cy0 + my0, x - cx0 + mx0, '◈' if it['slot'] == 'gem' else '◆', cp(RCOL[it['rarity']], True))
     for e in g.en:
-        if (e['x'], e['y']) in g.vis:
-            put(win, e['y'] - cy0 + 2, e['x'] - cx0, e['gl'], cp(2, True) if e['champ'] else cp(3 if e['slow'] else 2))
-    put(win, g.py - cy0 + 2, g.px - cx0, '@', cp(5, True))
+        if (e['x'], e['y']) in g.vis and inside(e['y'] - cy0, e['x'] - cx0):
+            put(win, e['y'] - cy0 + my0, e['x'] - cx0 + mx0, e['gl'], cp(2, True) if e['champ'] else cp(3 if e['slow'] else 2))
+    put(win, g.py - cy0 + my0, g.px - cx0 + mx0, '@', cp(5, True))
     bar = lambda v, m, n: '█' * int(n * max(0, v) / max(1, m)) + '░' * (n - int(n * max(0, v) / max(1, m)))
-    put(win, 0, 0, f'♥{g.hp}/{s["hp"]} ', cp(2, True))
-    put(win, 0, 9 + len(str(g.hp)) + len(str(s['hp'])), f'{bar(g.hp, s["hp"], 8)}', cp(2))
-    put(win, 1, 0, f'✦{g.mana}/{s["mana"]} {bar(g.mana, s["mana"], 8)}', cp(5))
-    put(win, 0, w - 18, f'Lv{g.lvl} ▼D{g.depth}' + (f' ✚{g.points}' if g.points else ''), cp(4, True))
-    xpn = int(18 * g.lvl ** 1.5)
-    put(win, 1, w - 18, f'xp {g.xp}/{xpn}', curses.A_DIM)
-    put(win, 2, w - 18, getattr(g, 'clock', ''), curses.A_DIM)
-    for i, m in enumerate(g.log[-3:]):
-        put(win, h - 5 + i, 0, m, curses.A_DIM if i < 2 else 0)
-    sb = ''
-    for i, k in enumerate(g.slots):
-        sk = SKILLS[k]
-        c = g.cd.get(k, 0)
-        sb += f'{i + 1}:{sk["name"][:9]}{"(" + str(c) + ")" if c else "":<3}{sk["cost"]} '
-    put(win, h - 2, 0, sb, cp(7))
-    put(win, h - 1, 0, 'hjkl/arrows move 1-4 skill i gear K skills t tree > stairs', curses.A_DIM)
+    put(win, 0, 0, f'♥{g.hp}/{s["hp"]} {bar(g.hp, s["hp"], 10)}', cp(2, True))
+    put(win, 1, 0, f'✦{g.mana}/{s["mana"]} {bar(g.mana, s["mana"], 10)}', cp(5))
+    put(win, 0, w - 22, f'Lv{g.lvl} ▼D{g.depth}' + (f' ✚{g.points}' if g.points else ''), cp(4, True))
+    put(win, 1, w - 22, f'xp {g.xp}/{int(18 * g.lvl ** 1.5)}  {getattr(g, "clock", "")}', curses.A_DIM)
+    nlog = 2 if touch else 3
+    for i, m in enumerate(g.log[-nlog:]):
+        put(win, h - nlog - (0 if touch else 2) + i, 0, m, curses.A_DIM if i < nlog - 1 else 0)
+    if touch:
+        y0 = h - 2 - 9
+        for r, row in enumerate(PAD):
+            for c, (lab, key) in enumerate(row):
+                button(win, btns, y0 + 3 * r, 1 + 6 * c, 3, 6, [lab], key, curses.A_DIM if key != ord('.') else 0)
+        y1 = h - 2 - 11
+        for i, k in enumerate(g.slots):
+            sk = SKILLS[k]
+            cd = g.cd.get(k, 0)
+            ready = not cd and g.mana >= sk['cost']
+            second = f'{sk["cost"]}mp' + (f' cd{cd}' if cd else '')
+            button(win, btns, y1 + 4 * (i // 2), w - PANEL + 10 * (i % 2), 4, 10,
+                   [f'{i + 1} {sk["name"][:7]}', second], ord('1') + i, cp(7, True) if ready else curses.A_DIM)
+        for i, (lab, key) in enumerate(ACTIONS):
+            on_stairs = key == ord('>') and g.g[g.py][g.px] == '>'
+            button(win, btns, y1 + 8, w - PANEL + 5 * i, 3, 5, [lab], key, cp(4, True) if on_stairs else curses.A_DIM)
+    else:
+        sb = ''
+        for i, k in enumerate(g.slots):
+            sk = SKILLS[k]
+            c = g.cd.get(k, 0)
+            sb += f'{i + 1}:{sk["name"][:9]}{"(" + str(c) + ")" if c else "":<3}{sk["cost"]} '
+        put(win, h - 2, 0, sb, cp(7))
+        put(win, h - 1, 0, 'hjklyubn/arrows move 1-4 skill i gear K skills t tree > stairs', curses.A_DIM)
     win.refresh()
 
 
 KEYS = {ord('h'): (-1, 0), ord('l'): (1, 0), ord('k'): (0, -1), ord('j'): (0, 1), curses.KEY_LEFT: (-1, 0), curses.KEY_RIGHT: (1, 0),
-        curses.KEY_UP: (0, -1), curses.KEY_DOWN: (0, 1), ord('a'): (-1, 0), ord('d'): (1, 0), ord('w'): (0, -1), ord('s'): (0, 1)}
+        curses.KEY_UP: (0, -1), curses.KEY_DOWN: (0, 1), ord('a'): (-1, 0), ord('d'): (1, 0), ord('w'): (0, -1), ord('s'): (0, 1),
+        ord('y'): (-1, -1), ord('u'): (1, -1), ord('b'): (-1, 1), ord('n'): (1, 1)}
 
 
 def item_lines(g, it):
@@ -667,32 +751,46 @@ def item_lines(g, it):
     return out
 
 
+def scroll_top(sel, avail, n):
+    return max(0, min(sel - avail + 1, n - avail)) if sel >= avail else 0
+
+
 def menu_inv(win, g):
     sel = 0
     while True:
         win.erase()
-        put(win, 0, 0, 'GEAR  enter=equip x=drop esc=back', cp(4, True))
-        y = 1
-        for slot, it in g.equip.items():
+        h, w = win.getmaxyx()
+        half = w // 2
+        put(win, 0, 0, 'GEAR', cp(4, True))
+        for y, (slot, it) in enumerate(g.equip.items(), 1):
             put(win, y, 0, f'[{slot[:3]}] ' + (it['name'] if it else '-'), cp(RCOL[it['rarity']]) if it else curses.A_DIM)
-            y += 1
-        y += 1
-        for i, it in enumerate(g.pack):
+        avail = max(3, h - 5 - 3)
+        n = len(g.pack)
+        sel = min(sel, max(0, n - 1))
+        top = scroll_top(sel, avail, n)
+        for i in range(top, min(n, top + avail)):
+            it = g.pack[i]
             nm = ('Gem: ' + SKILLS[it['skill']]['name']) if it['slot'] == 'gem' else it['name']
-            put(win, y + i, 0, ('>' if i == sel else ' ') + nm, cp(RCOL[it['rarity']], i == sel))
+            put(win, 5 + i - top, 0, ('>' if i == sel else ' ') + nm[:half - 2], cp(RCOL[it['rarity']], i == sel))
         if g.pack:
-            sel = min(sel, len(g.pack) - 1)
-            h, w = win.getmaxyx()
             for j, (t, a) in enumerate(item_lines(g, g.pack[sel])):
-                put(win, h - 9 + j, 0, t, a)
+                put(win, 1 + j, half, t, a)
+        btns = menu_bar(win, [('↑', ord('k')), ('↓', ord('j')), ('Equip', 10), ('Drop', ord('x')), ('Back', 27)])
         win.refresh()
-        c = win.getch()
+        c = getin(win, btns)
+        if isinstance(c, tuple):
+            row = c[1] - 5 + top
+            if 5 <= c[1] < 5 + avail and 0 <= row < n and c[2] < half:
+                if row == sel and g.pack[sel]['slot'] != 'gem':
+                    g.equip_item(sel)
+                sel = row
+            continue
         if c in (27, ord('q'), ord('i')):
             return
         if c in (curses.KEY_DOWN, ord('j')) and g.pack:
-            sel = (sel + 1) % len(g.pack)
+            sel = (sel + 1) % n
         elif c in (curses.KEY_UP, ord('k')) and g.pack:
-            sel = (sel - 1) % len(g.pack)
+            sel = (sel - 1) % n
         elif c in (10, 13) and g.pack:
             if g.pack[sel]['slot'] != 'gem':
                 g.equip_item(sel)
@@ -704,24 +802,37 @@ def menu_skills(win, g):
     sel = 0
     while True:
         win.erase()
-        put(win, 0, 0, 'SKILLS  j/k pick, 1-4 = put in slot, esc', cp(4, True))
-        for i, k in enumerate(g.slots):
-            put(win, 1 + i, 0, f'{i + 1}: {SKILLS[k]["name"]}', cp(7, True))
-        for i, k in enumerate(g.known):
-            sk = SKILLS[k]
-            put(win, 6 + i, 0, ('>' if i == sel else ' ') + f'{sk["name"]} ({sk["cost"]}mp)' + (' *' if k in g.slots else ''), cp(7 if k in g.slots else 1, i == sel))
-        sk = SKILLS[g.known[sel]]
         h, w = win.getmaxyx()
-        put(win, h - 3, 0, sk['desc'])
-        put(win, h - 2, 0, 'tags: ' + ' '.join(sorted(sk['tags'])), curses.A_DIM)
+        half = w // 2
+        put(win, 0, 0, 'SKILLS  tap a skill, then a slot button', cp(4, True))
+        avail = max(3, h - 2 - 3)
+        n = len(g.known)
+        top = scroll_top(sel, avail, n)
+        for i in range(top, min(n, top + avail)):
+            k = g.known[i]
+            sk = SKILLS[k]
+            put(win, 1 + i - top, 0, ('>' if i == sel else ' ') + f'{sk["name"]} ({sk["cost"]}mp)' + (' *' if k in g.slots else ''),
+                cp(7 if k in g.slots else 1, i == sel))
+        for i, k in enumerate(g.slots):
+            put(win, 1 + i, half, f'{i + 1}: {SKILLS[k]["name"]}', cp(7, True))
+        sk = SKILLS[g.known[sel]]
+        put(win, 6, half, sk['name'], cp(4, True))
+        put(win, 7, half, sk['desc'][:w - half - 1])
+        put(win, 8, half, 'tags: ' + ' '.join(sorted(sk['tags'])), curses.A_DIM)
+        btns = menu_bar(win, [('↑', ord('k')), ('↓', ord('j')), ('→1', ord('1')), ('→2', ord('2')), ('→3', ord('3')), ('→4', ord('4')), ('Back', 27)])
         win.refresh()
-        c = win.getch()
+        c = getin(win, btns)
+        if isinstance(c, tuple):
+            row = c[1] - 1 + top
+            if 1 <= c[1] < 1 + avail and 0 <= row < n and c[2] < half:
+                sel = row
+            continue
         if c in (27, ord('q')):
             return
         if c in (curses.KEY_DOWN, ord('j')):
-            sel = (sel + 1) % len(g.known)
+            sel = (sel + 1) % n
         elif c in (curses.KEY_UP, ord('k')):
-            sel = (sel - 1) % len(g.known)
+            sel = (sel - 1) % n
         elif ord('1') <= c <= ord('4'):
             k = g.known[sel]
             i = c - ord('1')
@@ -737,12 +848,14 @@ def menu_tree(win, g):
     while True:
         win.erase()
         h, w = win.getmaxyx()
-        put(win, 0, 0, f'TREE  points:{g.points}  arrows move, enter=take, esc', cp(4, True))
+        put(win, 0, 0, f'TREE  points:{g.points}  tap a node to focus, tap it again to take', cp(4, True))
         fr = g.frontier()
-        for sy in range(1, h - 5):
-            for sx in range(0, w - 1, 2):
-                y = cy + (sy - h // 2 + 2) // 2
-                if (sy - h // 2 + 2) % 2 or (sx - w // 2) % 4:
+        for sy in range(1, h - 7):
+            if (sy - h // 2 + 2) % 2:
+                continue
+            y = cy + (sy - h // 2 + 2) // 2
+            for sx in range(0, w - 1):
+                if (sx - w // 2) % 4:
                     continue
                 x = cx + (sx - w // 2) // 4
                 if (x, y) in g.alloc:
@@ -758,10 +871,20 @@ def menu_tree(win, g):
                 put(win, sy, sx, ch, a)
         n = node_at(g.seed, cx, cy)
         state = 'taken' if (cx, cy) in g.alloc else 'available' if (cx, cy) in fr else 'unreachable'
-        put(win, h - 4, 0, f'{n["name"]} [{n["kind"]}] {state}', cp(4, True))
-        put(win, h - 3, 0, ', '.join(g.aff_text(k, v) for k, v in n['stats'].items()))
+        put(win, h - 6, 0, f'{n["name"]} [{n["kind"]}] {state}', cp(4, True))
+        put(win, h - 5, 0, ', '.join(g.aff_text(k, v) for k, v in n['stats'].items()))
+        btns = menu_bar(win, [('←', ord('h')), ('↑', ord('k')), ('↓', ord('j')), ('→', ord('l')), ('Take', 10), ('Back', 27)])
         win.refresh()
-        c = win.getch()
+        c = getin(win, btns)
+        if isinstance(c, tuple):
+            ty, tx = c[1], c[2]
+            if 1 <= ty < h - 7:
+                dx, dy = round((tx - w // 2) / 4), round((ty - h // 2 + 2) / 2)
+                if (dx, dy) == (0, 0):
+                    if not g.take((cx, cy)):
+                        g.say('Cannot take that')
+                cx, cy = cx + dx, cy + dy
+            continue
         if c in (27, ord('q'), ord('t')):
             return
         if c in KEYS:
@@ -780,6 +903,8 @@ def run(win):
                            curses.COLOR_MAGENTA, curses.COLOR_CYAN], 1):
         curses.init_pair(i, c, -1)
     win.keypad(True)
+    curses.mouseinterval(0)
+    curses.mousemask(curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED | curses.BUTTON1_RELEASED)
     win.timeout(20000)
     try:
         g = Game.load() if os.path.exists(SAVE) else Game()
@@ -788,6 +913,7 @@ def run(win):
     mins = next((int(sys.argv[i + 1]) for i, a in enumerate(sys.argv) if a == '--mins'), 120)
     end = time.time() + mins * 60
     warned = False
+    btns = []
     signal.signal(signal.SIGHUP, lambda *a: (g.save(), sys.exit(0)))
     while True:
         left = end - time.time()
@@ -795,13 +921,14 @@ def run(win):
         if left <= 600 and not warned:
             warned = True
             g.say('10 minutes left. Find a good stopping spot.')
-        draw(win, g)
+        touch = '--keys' not in sys.argv and win.getmaxyx()[0] >= 16 and (win.getmaxyx()[1] >= 80 or '--touch' in sys.argv)
+        draw(win, g, btns, touch)
         if left <= 0:
             g.save()
             win.erase()
             put(win, 2, 2, 'Time. Saved.', cp(4, True))
             put(win, 4, 2, 'Next: bus stop -> work,')
-            put(win, 5, 2, 'or lunch at grandmother\'s.')
+            put(win, 5, 2, "or lunch at grandmother's.")
             put(win, 7, 2, 'any key: close   C: keep playing 10m', curses.A_DIM)
             win.refresh()
             win.timeout(-1)
@@ -810,7 +937,15 @@ def run(win):
             win.timeout(20000)
             end, warned = time.time() + 600, True
             continue
-        c = win.getch()
+        c = getin(win, btns)
+        if isinstance(c, tuple):  # tap on the map: step toward that tile
+            my0, mx0, mh, mw, cy0, cx0 = g.view
+            ty, tx = c[1] - my0 + cy0, c[2] - mx0 + cx0
+            if my0 <= c[1] < my0 + mh and mx0 <= c[2] < mx0 + mw:
+                dx, dy = (tx > g.px) - (tx < g.px), (ty > g.py) - (ty < g.py)
+                c = ord('.') if not (dx or dy) else next(k for k, v in KEYS.items() if v == (dx, dy) and k < 256 and chr(k) in 'hjklyubn')
+            else:
+                continue
         if c == -1:
             continue
         used = False

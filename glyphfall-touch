@@ -1,0 +1,13 @@
+#!/bin/sh
+# Landscape launcher: rotate the panel, run the game in a fullscreen foot, rotate back on exit.
+export SWAYSOCK=$(ls /run/user/10000/sway-ipc.*.sock | head -1)
+OUT=DSI-1
+restore() { swaymsg output "$OUT" transform normal >/dev/null; }
+trap restore EXIT INT TERM HUP
+swaymsg output "$OUT" transform 90 >/dev/null
+sleep 0.5
+foot --app-id glyphfall -o "font=Roboto Mono:size=${GF_FONT:-9}" -o "pad=0x0" python3 "$HOME/projects/glyphfall/glyphfall.py" "$@" &
+FP=$!
+sleep 1
+swaymsg '[app_id="glyphfall"] fullscreen enable' >/dev/null
+wait $FP
