@@ -160,10 +160,14 @@ class GridWin:
                 return curses.KEY_MOUSE
 
 
+TICK = 0.4     # seconds per world turn (enemies act, regen, cooldowns count down)
+STEP, MELEE, CAST = 0.19, 0.34, 0.3   # player action lock times
+
+
 class App:
     def __init__(self):
         pygame.init()
-        pygame.key.set_repeat(230, 95)
+        pygame.key.set_repeat()
         win = os.environ.get('GF_WINDOW')
         if win:
             w, h = (int(v) for v in win.lower().split('x'))
@@ -191,6 +195,7 @@ class App:
         self.finger_seen = 0.0
         self.held, self.queue = {}, collections.deque()
         self.next_act, self.fl = 0.0, []
+        self.next_tick = time.time() + TICK
         self.flash, self.shake, self.hurt_a = {}, 0.0, 0.0
         self.quit_armed = 0.0
         self.pp = None
@@ -253,10 +258,6 @@ class App:
         gap = max(4, int(B * 0.08))
         m = int(UH * 0.025)
         self.btns = []
-        x0, y0 = m, UH - m - 3 * B - 2 * gap
-        for r, row in enumerate(G.PAD):
-            for c, (lab, key) in enumerate(row):
-                self.btns.append(dict(kind='pad', rect=pygame.Rect(x0 + c * (B + gap), y0 + r * (B + gap), B, B), label=lab, key=key, rep=0.095))
         pw, ph = int(B * 1.2), int(B * 0.62)
         for i, (lab, key) in enumerate((('HP', ord('p')), ('MP', ord('o')))):
             self.btns.append(dict(kind='pot', rect=pygame.Rect(m + i * (pw + gap), int(UH * 0.115), pw, ph), label=lab, key=key, rep=0))
@@ -270,7 +271,9 @@ class App:
         aw = (2 * sw + gap - 4 * gap) // 5
         for i, (lab, key) in enumerate(G.ACTIONS + [('Quit', ord('Q'))]):
             self.btns.append(dict(kind='act', rect=pygame.Rect(right - 2 * sw - gap + i * (aw + gap), UH - m - ah, aw, ah), label=lab, key=key, rep=0))
-        self.pad_rect = pygame.Rect(x0, y0, 3 * B + 2 * gap, 3 * B + 2 * gap)
+        self.stick_r = int(UH * 0.17)
+        self.stick_home = (m + int(B * 2.1), UH - m - int(B * 1.7))
+        self.stick_zone = pygame.Rect(0, int(UH * 0.2), int(W * 0.45), UH - int(UH * 0.2))
 
     def tile_of(self, x, y):
         cx, cy = self.cam
@@ -292,16 +295,15 @@ class App:
             if b:
                 self.held[pid] = dict(btn=b, next=now + 0.26 if b['rep'] else 1e18)
                 self.press(b['key'], now)
-            else:
-                self.held[pid] = dict(btn=None, map=(x, y), next=now + 0.0)
+            elif self.stick_zone.collidepoint(x, y) and not any(h.get('stick') for h in self.held.values()):
+                R = self.stick_r
+                cx = min(max(x, R + 6), self.W - R - 6)
+                cy = min(max(y, R + 6), self.UH - R - 6)
+                self.held[pid] = dict(btn=None, stick=True, c=(cx, cy), k=(x, y), next=1e18)
         elif kind == 'move' and pid in self.held:
             h = self.held[pid]
-            if h['btn'] and h['btn']['kind'] == 'pad':
-                b = self.btn_at(x, y)
-                if b and b['kind'] == 'pad' and b is not h['btn']:
-                    h['btn'], h['next'] = b, now
-            elif h.get('map'):
-                h['map'] = (x, y)
+            if h.get('stick'):
+                h['k'] = (x, y)
         elif kind == 'up':
             self.held.pop(pid, None)
 
@@ -312,20 +314,35 @@ class App:
 
     def repeat_held(self, now):
         for pid, h in list(self.held.items()):
-            if now < h['next']:
+            if now < h['next'] or not h['btn']:
                 continue
-            if h.get('map'):
-                tx, ty = self.tile_of(*h['map'])
-                dx, dy = (tx > self.g.px) - (tx < self.g.px), (ty > self.g.py) - (ty < self.g.py)
-                if dx or dy:
-                    key = next(k for k, v in G.KEYS.items() if v == (dx, dy) and k < 256 and chr(k) in 'hjklyubn')
-                    self.fire(key, now, 0.095)
-                    h['next'] = now + 0.095
-                else:
-                    h['next'] = now + 0.2
-            elif h['btn'] and h['btn']['rep']:
+            if h['btn']['rep']:
                 self.fire(h['btn']['key'], now, h['btn']['rep'])
                 h['next'] = now + h['btn']['rep']
+
+    def stick_vec(self):
+        for h in self.held.values():
+            if h.get('stick'):
+                vx, vy = h['k'][0] - h['c'][0], h['k'][1] - h['c'][1]
+                m = math.hypot(vx, vy)
+                R = self.stick_r
+                if m > R:
+                    vx, vy, m = vx * R / m, vy * R / m, R
+                return h['c'], (vx, vy), m / R
+        return None
+
+    def stick_dir(self):
+        v = self.stick_vec()
+        if not v or v[2] < 0.28:
+            return None
+        o = round(math.atan2(v[1][1], v[1][0]) / (math.pi / 4)) % 8
+        return ((1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0), (-1, -1), (0, -1), (1, -1))[o]
+
+    def key_dir(self):
+        k = pygame.key.get_pressed()
+        dx = (k[pygame.K_RIGHT] or k[pygame.K_d] or k[pygame.K_l]) - (k[pygame.K_LEFT] or k[pygame.K_a] or k[pygame.K_h])
+        dy = (k[pygame.K_DOWN] or k[pygame.K_s] or k[pygame.K_j]) - (k[pygame.K_UP] or k[pygame.K_w] or k[pygame.K_k])
+        return (dx, dy) if dx or dy else None
 
     def fire(self, key, now, interval):
         if not self.queue:
@@ -335,22 +352,38 @@ class App:
         if self.queue and now >= self.next_act:
             key = self.queue.popleft()
             used = self.act(key)
-            self.next_act = now + (0.092 if key in G.KEYS else 0.16 if used else 0.05)
+            self.next_act = max(self.next_act, now + (used if used else 0.05))
 
     # ---------- game actions
-    def act(self, c):
+    def move(self, dx, dy):
         g = self.g
-        used = False
+        tries = [(dx, dy)] + ([(dx, 0), (0, dy)] if dx and dy else [])
+        for mx, my in tries:
+            hit = g.enemy_at(g.px + mx, g.py + my)
+            if g.step(mx, my):
+                g.vision()
+                if hit and self.pp:
+                    self.pp[0] += mx * 0.4
+                    self.pp[1] += my * 0.4
+                return MELEE if hit else STEP
+        return 0.0
+
+    def act(self, c):
+        """Run one input; returns how long the player is locked afterwards (0 = nothing happened)."""
+        g = self.g
+        used = 0.0
         if c in G.KEYS:
-            used = g.step(*G.KEYS[c])
+            used = self.move(*G.KEYS[c])
         elif ord('1') <= c <= ord('4'):
-            used = g.cast(c - ord('1'))
+            used = CAST if g.cast(c - ord('1')) else 0.0
         elif c in (ord('.'), ord(' ')):
-            used = True
+            used = STEP
         elif c in (ord('>'), 10, 13):
-            used = g.descend()
+            used = 0.3 if g.descend() else 0.0
+            if used:
+                g.save()
         elif c in (ord('p'), ord('o')):
-            used = g.use_cons('hp' if c == ord('p') else 'mp')
+            used = 0.2 if g.use_cons('hp' if c == ord('p') else 'mp') else 0.0
         elif c == ord('i'):
             self.menu(G.menu_inv)
         elif c == ord('K'):
@@ -363,14 +396,25 @@ class App:
                 self.quit()
             self.quit_armed = now
             g.say('Tap Quit again to save and exit')
-        if used:
-            g.end_turn()
-            if g.turn % 40 == 0 or c in (ord('>'), 10, 13):
-                g.save()
-            if g.dead:
-                g.respawn()
-                g.save()
+        self.check_dead()
         return used
+
+    def check_dead(self):
+        g = self.g
+        if g.dead:
+            g.respawn()
+            g.save()
+
+    def world_tick(self, now):
+        """Enemies, regen, cooldowns and buffs advance on the wall clock, not on player actions."""
+        if now < self.next_tick:
+            return
+        self.next_tick = max(self.next_tick + TICK, now - TICK)
+        g = self.g
+        g.end_turn()
+        if g.turn % 60 == 0:
+            g.save()
+        self.check_dead()
 
     def menu(self, fn):
         self.held.clear()
@@ -380,6 +424,7 @@ class App:
         self.held.clear()
         self.queue.clear()
         self.next_act = time.time() + 0.15
+        self.next_tick = time.time() + TICK
 
     # ---------- visuals
     def make_tiles(self):
@@ -594,19 +639,34 @@ class App:
             t = gl.text(m, c, u)
             scr.blit(t, (self.W // 2 - t.get_width() // 2, y - (i + 1) * (u + 6)))
 
+    def draw_stick(self):
+        v = self.stick_vec()
+        R = self.stick_r
+        surf = pygame.Surface((R * 2 + 8, R * 2 + 8), pygame.SRCALPHA)
+        mid = (R + 4, R + 4)
+        if v:
+            c, (vx, vy), mag = v
+            pygame.draw.circle(surf, (30, 30, 50, 120), mid, R)
+            pygame.draw.circle(surf, (150, 148, 200, 200), mid, R, 3)
+            kn = (mid[0] + vx, mid[1] + vy)
+            pygame.draw.circle(surf, (210, 208, 245, 210 if mag >= 0.28 else 130), kn, int(R * 0.42))
+            self.screen.blit(surf, (c[0] - R - 4, c[1] - R - 4))
+        else:
+            pygame.draw.circle(surf, (30, 30, 50, 70), mid, R)
+            pygame.draw.circle(surf, (110, 108, 150, 130), mid, R, 2)
+            pygame.draw.circle(surf, (150, 148, 200, 110), mid, int(R * 0.42))
+            self.screen.blit(surf, (self.stick_home[0] - R - 4, self.stick_home[1] - R - 4))
+
     def draw_controls(self):
         g, scr, gl = self.g, self.screen, self.glyphs
+        self.draw_stick()
         down = {id(h['btn']) for h in self.held.values() if h['btn']}
         for b in self.btns:
             r = b['rect']
             pressed = id(b) in down
             kind = b['kind']
             fill, border, lines, color = (30, 30, 50), (110, 108, 150), [], PAL[1]
-            if kind == 'pad':
-                lines = [b['label']]
-                if b['key'] == ord('.'):
-                    border = (230, 228, 250)
-            elif kind == 'pot':
+            if kind == 'pot':
                 k = 'hp' if b['label'] == 'HP' else 'mp'
                 n = g.cons.get(k, 0)
                 ok = n and not g.potion_cd
@@ -640,7 +700,7 @@ class App:
                     ov = pygame.Surface((r.w - 6, int((r.h - 6) * cd / total)), pygame.SRCALPHA)
                     ov.fill((10, 10, 20, 150))
                     scr.blit(ov, (r.x + 3, r.y + 3))
-            size = int(r.h * (0.5 if kind == 'pad' else 0.3 if kind == 'skill' else 0.42))
+            size = int(r.h * (0.3 if kind == 'skill' else 0.42))
             total_h = len(lines) * size * 1.15
             for i, ln in enumerate(lines):
                 sz = size if not (kind == 'skill' and i) else int(size * 0.9)
@@ -665,6 +725,7 @@ class App:
         c = w.getch()
         if c == ord('C'):
             self.end, self.warned = time.time() + 600, True
+            self.next_tick = time.time() + TICK
             w.timeout(20000)
             return
         self.quit()
@@ -690,6 +751,11 @@ class App:
                         self.on_pointer(*p)
             self.repeat_held(now)
             self.pump_queue(now)
+            if not self.queue and now >= self.next_act:
+                d = self.stick_dir() or self.key_dir()
+                if d:
+                    self.next_act = now + (self.move(*d) or 0.05)
+            self.world_tick(now)
             left = self.end - now
             if left <= 600 and not self.warned:
                 self.warned = True
