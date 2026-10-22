@@ -461,6 +461,46 @@ class App:
         d = self.glyphs.glyph('▼', (110, 90, 50), int(T * 0.8))
         sd.blit(d, ((T - d.get_width()) // 2, (T - d.get_height()) // 2))
         out['stairs_dim'] = sd
+        rnd = random.Random(7)
+        def outdoor(kind, k):
+            c = lambda v: tuple(int(q * k) for q in v)
+            sf = pygame.Surface((T, T))
+            if kind in 'gfp':
+                sf.fill(c({'g': (38, 78, 36), 'f': (38, 78, 36), 'p': (96, 80, 52)[:3]}[kind]))
+                for _ in range(5):
+                    a, b = rnd.randint(0, T - 3), rnd.randint(0, T - 3)
+                    pygame.draw.rect(sf, c((54, 104, 48) if kind != 'p' else (116, 98, 66)), (a, b, 2, 2))
+                if kind == 'f':
+                    for col_ in ((230, 210, 90), (230, 120, 160), (240, 240, 240)):
+                        pygame.draw.circle(sf, c(col_), (rnd.randint(4, T - 5), rnd.randint(4, T - 5)), max(2, T // 14))
+            elif kind == '~':
+                sf.fill(c((30, 70, 130)))
+                for yy in (T // 4, T // 2, 3 * T // 4):
+                    pygame.draw.line(sf, c((90, 140, 210)), (T // 6, yy), (T // 2, yy), 2)
+            else:
+                sf.fill(c((38, 78, 36)))
+                if kind == 'T':
+                    pygame.draw.rect(sf, c((84, 58, 34)), (T // 2 - 2, T // 2, 4, T // 2 - 2))
+                    pygame.draw.circle(sf, c((22, 70, 30)), (T // 2, T // 2 - 1), int(T * 0.4))
+                    pygame.draw.circle(sf, c((36, 104, 44)), (T // 2 - 3, T // 2 - 4), int(T * 0.22))
+                else:
+                    pygame.draw.polygon(sf, c((110, 110, 118)), [(T // 6, T - 4), (T // 3, T // 4), (2 * T // 3, T // 5), (T - 4, T - 4)])
+                    pygame.draw.polygon(sf, c((150, 150, 158)), [(T // 3, T // 4), (2 * T // 3, T // 5), (T // 2, T // 2)])
+            return sf
+        for kind in 'gfpT~r':
+            for lvl, k in enumerate((1.0, 0.82, 0.64, 0.48)):
+                out[('o' + kind, lvl)] = outdoor(kind, k)
+            out['o' + kind + '_dim'] = outdoor(kind, 0.4)
+        for lvl, k in enumerate((1.0, 0.82, 0.64, 0.48)):
+            for nm in ('stairs',):
+                st_ = outdoor('g', k)
+                d = self.glyphs.glyph('▼', tuple(int(v * k) for v in PAL[4]), int(T * 0.8))
+                st_.blit(d, ((T - d.get_width()) // 2, (T - d.get_height()) // 2))
+                out[('stairs', lvl)] = st_
+        sd = outdoor('g', 0.4)
+        d = self.glyphs.glyph('▼', (110, 90, 50), int(T * 0.8))
+        sd.blit(d, ((T - d.get_width()) // 2, (T - d.get_height()) // 2))
+        out['stairs_dim'] = sd
         tele = pygame.Surface((T, T), pygame.SRCALPHA)
         tele.fill((255, 60, 70, 255))
         out['tele'] = tele
@@ -549,9 +589,9 @@ class App:
                 t = row[tx]
                 if (tx, ty) in vis:
                     lvl = min(3, int(math.hypot(tx - px, ty - py) / 9 * 3.2))
-                    s = tl[('wall' if t == '#' else 'stairs' if t == '>' else 'floor', lvl)]
+                    s = tl[('stairs', lvl) if t == '>' else ('o' + g.ter[ty][tx], lvl)]
                 else:
-                    s = tl['wall_dim' if t == '#' else 'stairs_dim' if t == '>' else 'floor_dim']
+                    s = tl['stairs_dim' if t == '>' else 'o' + g.ter[ty][tx] + '_dim']
                 scr.blit(s, (tx * T - cx, ty * T - cy))
         now = time.time()
         pulse = 0.5 + 0.5 * math.sin(now * 9)

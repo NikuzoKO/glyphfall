@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """glyphfall: terminal ARPG. Classless, skill-swap builds, affix loot, infinite passive grid."""
-import curses, locale, random, zlib, json, os, sys, time, signal
+import math, curses, locale, random, zlib, json, os, sys, time, signal
 
 SAVE = os.path.expanduser('~/.local/share/glyphfall/save.json')
 
@@ -378,22 +378,66 @@ class Game:
         g = [['#'] * W for _ in range(H)]
         rooms = []
         for _ in range(80):
-            w, h = r.randint(5, 12), r.randint(4, 7)
+            w, h = r.randint(8, 16), r.randint(6, 10)
             x, y = r.randint(1, W - w - 2), r.randint(1, H - h - 2)
             if any(x < a + c + 1 and a < x + w + 1 and y < b + d + 1 and b < y + h + 1 for a, b, c, d in rooms):
                 continue
+            rx, ry = w / 2, h / 2
+            mx, my = x + rx - 0.5, y + ry - 0.5
+            ph = r.random() * 6.28
             for j in range(y, y + h):
                 for i in range(x, x + w):
-                    g[j][i] = '.'
+                    ang = math.atan2((j - my) / ry, (i - mx) / rx)
+                    lim = 1.0 + 0.18 * math.sin(3 * ang + ph) + 0.1 * math.sin(5 * ang - ph)
+                    if ((i - mx) / rx) ** 2 + ((j - my) / ry) ** 2 <= lim * lim * 0.9:
+                        g[j][i] = '.'
             rooms.append((x, y, w, h))
             if len(rooms) >= 11:
                 break
         cen = [(x + w // 2, y + h // 2) for x, y, w, h in rooms]
+        path = set()
         for (x1, y1), (x2, y2) in zip(cen, cen[1:]):
-            for i in range(min(x1, x2), max(x1, x2) + 1):
-                g[y1][i] = '.'
-            for j in range(min(y1, y2), max(y1, y2) + 1):
-                g[j][x2] = '.'
+            x, y = x1, y1
+            while (x, y) != (x2, y2):
+                if r.random() < 0.5 and x != x2 or y == y2:
+                    x += 1 if x2 > x else -1
+                else:
+                    y += 1 if y2 > y else -1
+                for dx, dy in ((0, 0), (1, 0), (0, 1)):
+                    if 0 < x + dx < W - 1 and 0 < y + dy < H - 1:
+                        if g[y + dy][x + dx] == '#':
+                            path.add((x + dx, y + dy))
+                        g[y + dy][x + dx] = '.'
+        for x, y in cen:
+            g[y][x] = '.'
+        # terrain: trees/rocks/water block, grass/flowers/paths are floor
+        keep = set(cen) | {(x + dx, y + dy) for x, y in cen for dx in (-1, 0, 1) for dy in (-1, 0, 1)}
+        ter = [[('T' if r.random() < 0.8 else 'r') if g[j][i] == '#' else ('p' if (i, j) in path else 'f' if r.random() < 0.06 else 'g')
+                for i in range(W)] for j in range(H)]
+        for _ in range(len(rooms) * 3):
+            ox, oy = r.randint(2, W - 3), r.randint(2, H - 3)
+            kind = r.choice('~~T')
+            for _ in range(r.randint(3, 9)):
+                ox, oy = ox + r.randint(-1, 1), oy + r.randint(-1, 1)
+                if 0 < ox < W - 1 and 0 < oy < H - 1 and g[oy][ox] == '.' and (ox, oy) not in keep and (ox, oy) not in path:
+                    g[oy][ox] = '#'
+                    ter[oy][ox] = kind
+        # keep everything reachable
+        seen_ = {cen[0]}
+        todo = [cen[0]]
+        while todo:
+            cx_, cy_ = todo.pop()
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                n = (cx_ + dx, cy_ + dy)
+                if n not in seen_ and g[n[1]][n[0]] != '#':
+                    seen_.add(n)
+                    todo.append(n)
+        for j in range(H):
+            for i in range(W):
+                if g[j][i] != '#' and (i, j) not in seen_:
+                    g[j][i] = '#'
+                    ter[j][i] = 'T'
+        self.ter = ter
         self.g = g
         self.px, self.py = cen[0]
         sx, sy = cen[-1]
@@ -405,10 +449,12 @@ class Game:
             n = r.randint(1, 2 + self.depth // 3)
             for _ in range(n):
                 ex, ey = r.randint(x, x + w - 1), r.randint(y, y + h - 1)
-                if (ex, ey) != (sx, sy) and not self.enemy_at(ex, ey):
+                if g[ey][ex] == '.' and (ex, ey) != (sx, sy) and not self.enemy_at(ex, ey):
                     self.spawn(ex, ey, r)
             if r.random() < 0.35:
-                self.drop(r.randint(x, x + w - 1), r.randint(y, y + h - 1), 0)
+                dx_, dy_ = r.randint(x, x + w - 1), r.randint(y, y + h - 1)
+                if g[dy_][dx_] == '.':
+                    self.drop(dx_, dy_, 0)
         self.chests = {}
         if len(rooms) > 3 and r.random() < 0.6:
             x, y, w, h = r.choice(rooms[2:-1])
@@ -416,7 +462,8 @@ class Game:
             if not self.enemy_at(*cxy) and g[cxy[1]][cxy[0]] == '.':
                 self.chests[cxy] = True
         if boss:
-            e = self.spawn(sx - 1, sy, r, boss=True)
+            bp = self.free_near(sx, sy, 1) or (sx, sy)
+            e = self.spawn(bp[0], bp[1], r, boss=True)
         self.say(f'-- Depth {self.depth} --' + ('  A boss guards the stairs.' if boss else ''))
         self.vision()
 
@@ -1491,7 +1538,8 @@ def draw(win, g, btns, touch):
             if not (0 <= x < W and 0 <= y < H) or not g.seen[y][x]:
                 continue
             t, v = g.g[y][x], (x, y) in g.vis
-            ch = '▓' if t == '#' else '▼' if t == '>' else '·'
+            tr = g.ter[y][x]
+            ch = {'T': '♣', 'r': '▲', '~': '≈'}.get(tr, '▓') if t == '#' else '▼' if t == '>' else '"' if tr == 'f' else '·'
             col = cp(4, True) if t == '>' else cp(1)
             put(win, sy + my0, sx + mx0, ch, col if v else curses.A_DIM)
     for (x, y), its in g.items.items():
