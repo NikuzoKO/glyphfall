@@ -149,6 +149,16 @@ def rune_name(rk):
     return f'{RUNES[t]["name"]} T{n}'
 
 
+# ---- enemy affixes (champions get 1-3 by depth) and boss kinds with telegraphed attacks
+EAFF = {'fast': 'acts twice per turn', 'shielded': 'absorbs the first 40% of its life in damage', 'explosive': 'blasts adjacent tiles when it dies',
+        'mender': 'heals nearby allies', 'thorned': 'reflects some damage when you are close', 'vampiric': 'heals when it hits you',
+        'draining': 'its hits drain your mana', 'summoner': 'calls minions', 'teleporter': 'blinks next to you'}
+BOSS_KINDS = [dict(name='Warden', gl='Ω', tele='slam', info='slams the ground around itself'),
+              dict(name='Pyre Lord', gl='Ψ', tele='volley', info='rains fire where you stand'),
+              dict(name='Void Seer', gl='Φ', tele='nova', info='sends a ring of void; stay close or run far'),
+              dict(name='Bone Queen', gl='Σ', tele='cross', info='fires bone lines along her row and column')]
+
+
 SLOTNAME = {'weapon': 'Weapon', 'armor': 'Armor', 'charm': 'Amulet'}
 CONS = {'hp': ('Health Potion', 'Heal 40% of max life'), 'mp': ('Mana Potion', 'Restore 60% of max mana'),
         'rejuv': ('Rejuvenation', 'Heal and restore 50% of both'), 'map': ('Map Scroll', 'Reveal the whole level')}
@@ -406,24 +416,116 @@ class Game:
                 self.chests[cxy] = True
         if boss:
             e = self.spawn(sx - 1, sy, r, boss=True)
-        self.say(f'-- Depth {self.depth} --' + ('  A presence guards the stairs.' if boss else ''))
+        self.say(f'-- Depth {self.depth} --' + ('  A boss guards the stairs.' if boss else ''))
         self.vision()
 
-    def spawn(self, x, y, r, boss=False):
+    def spawn(self, x, y, r, boss=False, add=False):
         pool = [e for e in ENEMIES if e[5] <= self.depth] or ENEMIES[:1]
         n, gl, hp, dm, xp, _, fl = r.choice(pool[-5:])
         tier = (self.depth - 1) // 10
         sc = (1 + 0.22 * (self.depth - 1)) * (1.5 ** tier)
         pre = ['', 'Elder ', 'Ancient ', 'Primal ', 'Eternal '][min(tier, 4)] + ('Mythic ' * max(0, tier - 4))
-        champ = r.random() < 0.12
+        champ = not add and not boss and r.random() < 0.12
+        aff, bk = [], None
         if boss:
-            n, gl, hp, dm, xp, fl, champ = 'Warden', 'Ω', hp * 5, dm * 2, xp * 8, '', False
-        if champ:
+            bk = BOSS_KINDS[(self.depth // 5 - 1) % len(BOSS_KINDS)]
+            n, gl, hp, dm, xp, fl = bk['name'], bk['gl'], 70, 10, 100, ''
+        elif add:
+            hp, dm, xp = hp * 0.5, int(dm * 0.6), xp * 0.4
+        elif champ:
             hp, dm, xp, gl = hp * 2, int(dm * 1.5), xp * 3, gl.upper()
-        e = dict(name=pre + ('Champion ' if champ else '') + n, gl=gl, hp=int(hp * sc), mhp=int(hp * sc), dmg=max(1, int(dm * sc)), xp=int(xp * sc),
-                 x=x, y=y, fl=fl, slow=0, dots=[], champ=champ or boss, boss=boss, awake=False)
+            aff = r.sample(list(EAFF), 1 + (self.depth >= 10) + (self.depth >= 30))
+        elif self.depth >= 15 and r.random() < 0.10:
+            aff = [r.choice(list(EAFF))]
+        xp *= 1 + 0.5 * len(aff)
+        if 'fast' in aff:
+            fl += ' fast'
+        e = dict(name=pre + (' '.join(a.title() for a in aff) + ' ' if aff else '') + ('Champion ' if champ else '') + n, gl=gl,
+                 hp=int(hp * sc), mhp=int(hp * sc), dmg=max(1, int(dm * sc)), xp=int(xp * sc), x=x, y=y, fl=fl, slow=0, dots=[],
+                 champ=champ or boss or bool(aff), boss=boss, awake=False, aff=aff, bk=bk, phase=1, tele=None, cd=3, add=add, told=False)
+        if 'shielded' in aff:
+            e['shield'] = int(e['mhp'] * 0.4)
         self.en.append(e)
         return e
+
+    def free_near(self, x, y, r=2):
+        spots = [(x + dx, y + dy) for dx in range(-r, r + 1) for dy in range(-r, r + 1)
+                 if self.g[y + dy][x + dx] != '#' and not self.enemy_at(x + dx, y + dy) and (x + dx, y + dy) != (self.px, self.py)]
+        return self.rng.choice(spots) if spots else None
+
+    def summon(self, e, n):
+        mine = sum(1 for o in self.en if o.get('owner') == id(e))
+        for _ in range(min(n, 6 - mine)):
+            p = self.free_near(e['x'], e['y'])
+            if p:
+                m = self.spawn(p[0], p[1], self.rng, add=True)
+                m['owner'], m['awake'] = id(e), True
+
+    def affix_tick(self, e):
+        """Per-turn behaviour of affixed enemies. Returns True if the enemy used its action."""
+        t = self.turn + id(e) % 7
+        if 'mender' in e['aff'] and t % 3 == 0:
+            for o in self.en:
+                if o is not e and self.near(o, e, 25) and o['hp'] < o['mhp']:
+                    o['hp'] = min(o['mhp'], o['hp'] + max(1, int(o['mhp'] * 0.15)))
+        if 'summoner' in e['aff'] and t % 6 == 0:
+            self.summon(e, 1)
+        if 'teleporter' in e['aff'] and t % 5 == 0 and max(abs(e['x'] - self.px), abs(e['y'] - self.py)) > 3:
+            p = self.free_near(self.px, self.py, 1)
+            if p:
+                e['x'], e['y'] = p
+                self.say(f'{e["name"]} blinks next to you!')
+                return True
+        return False
+
+    def boss_tiles(self, e, kind):
+        floor = lambda x, y: 0 <= x < W and 0 <= y < H and self.g[y][x] != '#'
+        tiles = set()
+        if kind == 'slam':
+            tiles = {(e['x'] + dx, e['y'] + dy) for dx in range(-2, 3) for dy in range(-2, 3)}
+        elif kind == 'volley':
+            cs = [(self.px, self.py)] + [(self.px + self.rng.randint(-3, 3), self.py + self.rng.randint(-3, 3)) for _ in range(2 + e['phase'])]
+            tiles = {(cx + dx, cy + dy) for cx, cy in cs for dx in (-1, 0, 1) for dy in (-1, 0, 1)}
+        elif kind == 'nova':
+            tiles = {(e['x'] + dx, e['y'] + dy) for dx in range(-4, 5) for dy in range(-4, 5) if 3 <= max(abs(dx), abs(dy)) <= 4}
+        else:
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                x, y = e['x'] + dx, e['y'] + dy
+                while floor(x, y) and abs(x - e['x']) + abs(y - e['y']) <= 12:
+                    tiles.add((x, y))
+                    x, y = x + dx, y + dy
+        return {t for t in tiles if floor(*t)}
+
+    def boss_act(self, e):
+        """Phases at 66%/33% life, telegraphed attacks that resolve two turns later. True = skip normal move/attack."""
+        frac = e['hp'] / max(1, e['mhp'])
+        ph = 1 + (frac < 0.66) + (frac < 0.33)
+        if ph > e['phase']:
+            e['phase'] = ph
+            e['dmg'] = int(e['dmg'] * 1.2)
+            self.say(f'{e["name"]} ENRAGES! (phase {ph})')
+            self.summon(e, 2 + ph)
+        kind = e['bk']['tele']
+        if e['tele']:
+            e['tele']['t'] -= 1
+            if e['tele']['t'] <= 0:
+                if (self.px, self.py) in e['tele']['tiles']:
+                    self.say(f'{e["name"]}\'s {kind} hits you!')
+                    self.hurt(e, e['tele']['mult'])
+                e['tele'] = None
+            return kind == 'slam'
+        e['cd'] -= 1
+        if e['cd'] <= 0 and max(abs(e['x'] - self.px), abs(e['y'] - self.py)) <= 12:
+            e['cd'] = max(3, 6 - e['phase'])
+            e['tele'] = dict(tiles=self.boss_tiles(e, kind), t=2, mult={'slam': 3.0, 'volley': 2.5, 'nova': 3.0, 'cross': 2.5}[kind])
+            self.say(f'{e["name"]} prepares a {kind}! Get out of the red.')
+            if kind == 'cross' and e['phase'] > 1:
+                self.summon(e, 1)
+            if kind == 'nova' and e['phase'] > 1:
+                p = self.free_near(self.px, self.py, 2)
+                if p:
+                    e['x'], e['y'] = p
+        return False
 
     def enemy_at(self, x, y):
         return next((e for e in self.en if e['x'] == x and e['y'] == y), None)
@@ -711,6 +813,12 @@ class Game:
         for e in self.en:
             if (e['x'], e['y']) in self.vis:
                 e['awake'] = True
+                if not e['told'] and (e['aff'] or e['boss']):
+                    e['told'] = True
+                    if e['boss']:
+                        self.say(f'{e["name"]}: {e["bk"]["info"]}. Phases at 66% and 33%.')
+                    else:
+                        self.say(f'{e["name"]}: ' + '; '.join(EAFF[a] for a in e['aff']))
 
     # ---- combat
     def calc(self, base, tags, melee_weapon=False):
@@ -731,9 +839,21 @@ class Game:
             return 0
         if e['slow'] > 0 and self.ms.get('shatter'):
             dmg = int(dmg * (1 + self.ms['shatter'] / 100))
+        if e.get('shield', 0) > 0:
+            ab = min(e['shield'], dmg)
+            e['shield'] -= ab
+            dmg -= ab
+            if dmg <= 0:
+                e['awake'] = True
+                self.say(f'{src}{e["name"]} shield absorbs {ab}')
+                return 0
         self.last_dmg = dmg
         e['hp'] -= dmg
         e['awake'] = True
+        if 'thorned' in e['aff'] and max(abs(e['x'] - self.px), abs(e['y'] - self.py)) <= 2:
+            th = max(1, int(dmg * 0.15))
+            self.hp -= th
+            self.say(f'Thorns -{th}')
         lc = self.st('leech') + self.ms.get('sk_leech', 0)
         if lc:
             self.hp = min(self.st('hp'), self.hp + max(0, int(dmg * lc / 100)))
@@ -770,6 +890,12 @@ class Game:
                     self.hit(o, dmg, False, 'Blast: ')
             finally:
                 self._boom = False
+        if 'explosive' in e['aff'] and max(abs(e['x'] - self.px), abs(e['y'] - self.py)) <= 2:
+            self.say(f'{e["name"]} explodes!')
+            self.hurt(e, 2.0)
+        if e.get('add'):
+            self.gain_xp(e['xp'])
+            return
         if e.get('spread') and e['dots']:
             for o in [o for o in self.en if self.near(o, e)]:
                 o['dots'] += list(e['dots'])
@@ -1019,7 +1145,7 @@ class Game:
             self.say('No target')
             return False
         dx, dy = t['x'] - self.px, t['y'] - self.py
-        n = max(abs(dx), abs(dy))
+        n = max(1, abs(dx), abs(dy))
         hit, k = set(), 0
         for i in range(1, sk['rng'] + self.mp('sk_range') + 1):
             x, y = self.px + round(dx * i / n), self.py + round(dy * i / n)
@@ -1168,9 +1294,18 @@ class Game:
         a = self.stats().get('armor', 0)
         d = max(1, int(e['dmg'] * mult * (1 - a / (a + 30 + 8 * self.depth))))
         self.hp -= d
+        if 'vampiric' in e['aff']:
+            e['hp'] = min(e['mhp'], e['hp'] + d // 2)
+        if 'draining' in e['aff']:
+            self.mana = max(0, self.mana - max(1, self.st('mana') // 20))
         self.say(f'{e["name"]} hits you -{d}')
 
     def enemy_act(self, e):
+        if e['boss']:
+            if self.boss_act(e):
+                return
+        elif e['aff'] and self.affix_tick(e):
+            return
         dx, dy = self.px - e['x'], self.py - e['y']
         dist = max(abs(dx), abs(dy))
         if dist == 1:
@@ -1358,8 +1493,14 @@ def draw(win, g, btns, touch):
         if g.seen[y][x] and inside(y - cy0, x - cx0):
             put(win, y - cy0 + my0, x - cx0 + mx0, '▣', cp(4, True))
     for e in g.en:
+        if e['tele']:
+            for (x, y) in e['tele']['tiles']:
+                if g.seen[y][x] and inside(y - cy0, x - cx0):
+                    put(win, y - cy0 + my0, x - cx0 + mx0, '▓' if e['tele']['t'] <= 1 else '▒', cp(2, True))
+    for e in g.en:
         if (e['x'], e['y']) in g.vis and inside(e['y'] - cy0, e['x'] - cx0):
-            put(win, e['y'] - cy0 + my0, e['x'] - cx0 + mx0, e['gl'], cp(2, True) if e['champ'] else cp(3 if e['slow'] else 2))
+            col = cp(5, True) if e.get('shield', 0) > 0 else cp(2, True) if e['champ'] else cp(3 if e['slow'] else 2)
+            put(win, e['y'] - cy0 + my0, e['x'] - cx0 + mx0, e['gl'], col)
     put(win, g.py - cy0 + my0, g.px - cx0 + mx0, '@', cp(5, True))
     bar = lambda v, m, n: '█' * int(n * max(0, v) / max(1, m)) + '░' * (n - int(n * max(0, v) / max(1, m)))
     put(win, 0, 0, f'♥{g.hp}/{s["hp"]} {bar(g.hp, s["hp"], 10)}', cp(2, True))
