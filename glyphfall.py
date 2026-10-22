@@ -1,0 +1,769 @@
+#!/usr/bin/env python3
+"""glyphfall: terminal ARPG. Classless, skill-swap builds, affix loot, infinite passive grid."""
+import curses, locale, random, zlib
+
+W, H = 80, 40
+RARITY = ['normal', 'magic', 'rare', 'legend']
+RCOL = {'normal': 1, 'magic': 7, 'rare': 4, 'legend': 6}
+TAGS = ['fire', 'cold', 'lightning', 'phys', 'poison', 'necro', 'projectile', 'aoe', 'melee', 'chain', 'movement']
+
+# ---- skills: no classes, just a pool. tags feed the *_pct stats from gear and tree.
+SKILLS = {
+    'whirlwind': dict(name='Whirlwind', cost=6, cd=0, tags={'phys', 'melee', 'aoe'}, base=10, desc='Hit everything adjacent. Scales with weapon.'),
+    'fireball': dict(name='Fireball', cost=8, cd=0, tags={'fire', 'projectile'}, base=14, rng=8, desc='Hurl fire at the nearest enemy. Burns.'),
+    'frost_nova': dict(name='Frost Nova', cost=10, cd=4, tags={'cold', 'aoe'}, base=9, desc='Ring of ice, radius 2. Slows.'),
+    'blink': dict(name='Blink Strike', cost=6, cd=3, tags={'phys', 'movement', 'melee'}, base=8, desc='Teleport 5 tiles the way you face, strike on landing.'),
+    'chain_lightning': dict(name='Chain Lightning', cost=9, cd=0, tags={'lightning', 'chain', 'projectile'}, base=10, rng=7, desc='Arcs through up to 4 enemies.'),
+    'bone_spear': dict(name='Bone Spear', cost=9, cd=1, tags={'phys', 'necro', 'projectile'}, base=16, rng=9, desc='Pierces a whole line of enemies.'),
+    'poison_cloud': dict(name='Poison Cloud', cost=11, cd=3, tags={'poison', 'aoe'}, base=4, rng=7, desc='Toxic cloud at target. Heavy damage over time.'),
+    'soul_siphon': dict(name='Soul Siphon', cost=7, cd=0, tags={'necro', 'projectile'}, base=8, rng=6, desc='Drain a target, heal 40% of damage.'),
+    'blood_pact': dict(name='Blood Pact', cost=0, cd=8, tags={'necro'}, base=0, desc='Pay 12% life: +20 mana and +50% damage for 6 turns.'),
+}
+START_SKILLS = ['whirlwind', 'fireball', 'frost_nova', 'blink']
+
+# ---- loot: (stat, label, lo, hi). value scales with item level.
+AFFIXES = [('hp', '+{} Life', 5, 12), ('mana', '+{} Mana', 4, 10), ('weapon', '+{} Weapon Dmg', 1, 3),
+           ('dmg_pct', '+{}% Damage', 4, 10), ('crit', '+{}% Crit', 2, 5), ('leech', '+{}% Life Leech', 1, 3),
+           ('armor', '+{} Armor', 3, 8), ('regen', '+{} Regen/10t', 1, 3), ('mregen', '+{} Mana Regen/10t', 1, 3),
+           ('find', '+{}% Item Find', 5, 15)] + \
+          [(t + '_pct', '+{}% ' + t.title() + ' Dmg', 8, 20) for t in TAGS]
+BASES = {'weapon': ['Rusty Blade', 'Bone Club', 'Cleaver', 'Glaive', 'Wand', 'Hookblade'],
+         'armor': ['Rags', 'Hide Vest', 'Chain Coat', 'Plate Scrap', 'Ash Robe'],
+         'charm': ['Fang', 'Rune Stone', 'Eye Idol', 'Ember Shard', 'Bone Ring']}
+PRE = ['Sturdy', 'Fierce', 'Gloomy', 'Wicked', 'Feral', 'Hexed', 'Arcane', 'Savage']
+RARE_A = ['Doom', 'Gore', 'Dread', 'Soul', 'Void', 'Rot', 'Storm', 'Ash']
+RARE_B = ['Bite', 'Coil', 'Brand', 'Edge', 'Veil', 'Grip', 'Song', 'Maw']
+
+# ---- enemies: name, glyph, hp, dmg, xp, min depth, flags
+ENEMIES = [('Rat', 'r', 8, 3, 4, 1, ''), ('Skeleton', 's', 14, 5, 7, 1, ''), ('Imp', 'i', 10, 4, 8, 2, 'ranged'),
+           ('Ghoul', 'g', 26, 7, 12, 3, ''), ('Wraith', 'W', 18, 8, 16, 4, 'fast'), ('Cultist', 'c', 22, 6, 14, 5, 'ranged'),
+           ('Golem', 'G', 60, 11, 30, 7, '')]
+
+
+def node_at(seed, x, y):
+    """Infinite passive grid: every (x,y) is a deterministic node."""
+    if (x, y) == (0, 0):
+        return dict(kind='origin', name='Origin', stats={})
+    r = random.Random(zlib.crc32(f'{seed}:{x}:{y}'.encode()))
+    roll = r.random()
+    scale = 1 + (abs(x) + abs(y)) * 0.04
+    if roll < 0.04:
+        k = r.choice([('Glass Cannon', {'more_dmg': 60, 'hp_mult': -40}), ('Arcane Surge', {'mana': 40, 'mregen': 3, 'dmg_pct': -10}),
+                      ('Iron Will', {'armor': 30, 'hp': 20, 'crit': -5}), ('Vampiric Pact', {'leech': 8, 'hp_mult': -20}),
+                      ('Elemental Rage', {'fire_pct': 40, 'cold_pct': 40, 'lightning_pct': 40, 'phys_pct': -30})])
+        return dict(kind='key', name=k[0], stats=k[1])
+    if roll < 0.20:
+        if r.random() < 0.7:
+            t = r.choice(TAGS)
+            return dict(kind='notable', name=r.choice(['Mastery', 'Focus', 'Fury', 'Pull', 'Edge']) + ' of ' + t.title(), stats={t + '_pct': int(18 * scale)})
+        s = r.choice([('leech', 3, 'Hunger'), ('find', 15, 'Fortune'), ('crit', 6, 'Precision'), ('hp', 25, 'Vigor')])
+        return dict(kind='notable', name=s[2], stats={s[0]: int(s[1] * scale)})
+    s = r.choice([('hp', 6), ('mana', 4), ('weapon', 1), ('dmg_pct', 3), ('crit', 2), ('armor', 3), ('regen', 1)])
+    return dict(kind='minor', name='Minor ' + s[0], stats={s[0]: max(1, int(s[1] * scale))})
+
+
+class Game:
+    def __init__(self, seed=None):
+        self.seed = seed or random.randrange(1 << 30)
+        self.rng = random.Random(self.seed)
+        self.depth = 0
+        self.lvl, self.xp, self.points = 1, 0, 0
+        self.alloc = {(0, 0)}
+        self.equip = {'weapon': None, 'armor': None, 'charm': None}
+        self.pack = []
+        self.known = list(START_SKILLS)
+        self.slots = list(START_SKILLS)
+        self.cd, self.buffs, self.log = {}, {}, []
+        self.face = (1, 0)
+        self.turn = 0
+        self.dead = False
+        self.hp, self.mana = 60, 30
+        self.new_level()
+        self.hp, self.mana = self.st('hp'), self.st('mana')
+
+    # ---- stats
+    def stats(self):
+        s = {}
+        def add(d):
+            for k, v in d.items():
+                s[k] = s.get(k, 0) + v
+        for it in self.equip.values():
+            if it:
+                add(dict(it['aff']))
+        for p in self.alloc:
+            add(node_at(self.seed, *p)['stats'])
+        s['hp'] = int((60 + 4 * (self.lvl - 1) + s.get('hp', 0)) * (1 + s.get('hp_mult', 0) / 100))
+        s['mana'] = 30 + 2 * (self.lvl - 1) + s.get('mana', 0)
+        s['weapon'] = 3 + s.get('weapon', 0)
+        return s
+
+    def st(self, k):
+        return self.stats().get(k, 0)
+
+    def say(self, m):
+        self.log.append(m)
+        del self.log[:-40]
+
+    # ---- level gen
+    def new_level(self):
+        self.depth += 1
+        r = random.Random(f'{self.seed}:{self.depth}')
+        g = [['#'] * W for _ in range(H)]
+        rooms = []
+        for _ in range(80):
+            w, h = r.randint(5, 12), r.randint(4, 7)
+            x, y = r.randint(1, W - w - 2), r.randint(1, H - h - 2)
+            if any(x < a + c + 1 and a < x + w + 1 and y < b + d + 1 and b < y + h + 1 for a, b, c, d in rooms):
+                continue
+            for j in range(y, y + h):
+                for i in range(x, x + w):
+                    g[j][i] = '.'
+            rooms.append((x, y, w, h))
+            if len(rooms) >= 11:
+                break
+        cen = [(x + w // 2, y + h // 2) for x, y, w, h in rooms]
+        for (x1, y1), (x2, y2) in zip(cen, cen[1:]):
+            for i in range(min(x1, x2), max(x1, x2) + 1):
+                g[y1][i] = '.'
+            for j in range(min(y1, y2), max(y1, y2) + 1):
+                g[j][x2] = '.'
+        self.g = g
+        self.px, self.py = cen[0]
+        sx, sy = cen[-1]
+        g[sy][sx] = '>'
+        self.seen = [[False] * W for _ in range(H)]
+        self.items, self.en = {}, []
+        boss = self.depth % 5 == 0
+        for k, (x, y, w, h) in enumerate(rooms[1:], 1):
+            n = r.randint(1, 2 + self.depth // 3)
+            for _ in range(n):
+                ex, ey = r.randint(x, x + w - 1), r.randint(y, y + h - 1)
+                if (ex, ey) != (sx, sy) and not self.enemy_at(ex, ey):
+                    self.spawn(ex, ey, r)
+            if r.random() < 0.35:
+                self.drop(r.randint(x, x + w - 1), r.randint(y, y + h - 1), 0)
+        if boss:
+            e = self.spawn(sx - 1, sy, r, boss=True)
+        self.say(f'-- Depth {self.depth} --' + ('  A presence guards the stairs.' if boss else ''))
+        self.vision()
+
+    def spawn(self, x, y, r, boss=False):
+        pool = [e for e in ENEMIES if e[5] <= self.depth] or ENEMIES[:1]
+        n, gl, hp, dm, xp, _, fl = r.choice(pool[-4:])
+        sc = 1 + 0.22 * (self.depth - 1)
+        champ = r.random() < 0.12
+        if boss:
+            n, gl, hp, dm, xp, fl, champ = 'Warden', 'Ω', hp * 5, dm * 2, xp * 8, '', False
+        if champ:
+            hp, dm, xp, gl = hp * 2, int(dm * 1.5), xp * 3, gl.upper()
+        e = dict(name=('Champion ' if champ else '') + n, gl=gl, hp=int(hp * sc), mhp=int(hp * sc), dmg=max(1, int(dm * sc)), xp=int(xp * sc),
+                 x=x, y=y, fl=fl, slow=0, dots=[], champ=champ or boss, boss=boss, awake=False)
+        self.en.append(e)
+        return e
+
+    def enemy_at(self, x, y):
+        return next((e for e in self.en if e['x'] == x and e['y'] == y), None)
+
+    # ---- loot
+    def drop(self, x, y, bonus):
+        find = 1 + self.st('find') / 100
+        roll = self.rng.random()
+        if roll < 0.12 * find:
+            it = dict(slot='gem', skill=self.rng.choice(list(SKILLS)), rarity='magic')
+        else:
+            it = self.make_item(self.depth, bonus, find)
+        self.items.setdefault((x, y), []).append(it)
+
+    def make_item(self, ilvl, bonus, find=1):
+        r = self.rng
+        x = r.random() / (find * (1 + bonus * 0.4)) ** 0.5
+        rar = 'legend' if x < 0.01 else 'rare' if x < 0.10 else 'magic' if x < 0.40 else 'normal'
+        slot = r.choice(['weapon', 'armor', 'charm'])
+        n = {'normal': 0, 'magic': r.randint(1, 2), 'rare': r.randint(3, 4), 'legend': r.randint(5, 6)}[rar]
+        aff, used = [], set()
+        sc = 1 + 0.08 * ilvl
+        if slot == 'weapon':
+            aff.append(('weapon', int((2 + r.randint(0, 2)) * sc)))
+        if slot == 'armor':
+            aff.append(('armor', int((3 + r.randint(0, 3)) * sc)))
+        for _ in range(n):
+            a = r.choice(AFFIXES)
+            if a[0] in used:
+                continue
+            used.add(a[0])
+            aff.append((a[0], max(1, int(r.uniform(a[2], a[3]) * sc))))
+        base = r.choice(BASES[slot])
+        name = base if rar == 'normal' else f'{r.choice(PRE)} {base}' if rar == 'magic' else \
+            f'{r.choice(RARE_A)}{r.choice(RARE_B).lower()} {base}' if rar == 'rare' else f'★ {r.choice(RARE_A)}{r.choice(RARE_B).lower()}, the {base}'
+        return dict(slot=slot, rarity=rar, name=name, aff=aff, ilvl=ilvl)
+
+    def aff_text(self, stat, v):
+        for a in AFFIXES:
+            if a[0] == stat:
+                return a[1].format(v)
+        return {'more_dmg': '+{}% More Damage', 'hp_mult': '{:+}% Max Life'}.get(stat, stat + ' {}').format(v)
+
+    def pickup(self):
+        for it in self.items.pop((self.px, self.py), []):
+            if it['slot'] == 'gem':
+                sk = it['skill']
+                if sk in self.known:
+                    self.gain_xp(10 * self.depth)
+                    self.say(f'Duplicate gem {SKILLS[sk]["name"]} -> xp')
+                else:
+                    self.known.append(sk)
+                    self.say(f'LEARNED {SKILLS[sk]["name"]}! (K to slot it)')
+            elif len(self.pack) >= 24:
+                self.say('Pack full.')
+                self.items.setdefault((self.px, self.py), []).append(it)
+            else:
+                self.pack.append(it)
+                self.say(f'Picked up {it["name"]}')
+
+    # ---- vision
+    def los(self, x0, y0, x1, y1):
+        dx, dy = abs(x1 - x0), abs(y1 - y0)
+        sx, sy = (1 if x1 > x0 else -1), (1 if y1 > y0 else -1)
+        err, x, y = dx - dy, x0, y0
+        while (x, y) != (x1, y1):
+            if (x, y) != (x0, y0) and self.g[y][x] == '#':
+                return False
+            e2 = 2 * err
+            if e2 > -dy:
+                err -= dy
+                x += sx
+            if e2 < dx:
+                err += dx
+                y += sy
+        return True
+
+    def vision(self):
+        self.vis = set()
+        R = 9
+        for y in range(max(0, self.py - R), min(H, self.py + R + 1)):
+            for x in range(max(0, self.px - R), min(W, self.px + R + 1)):
+                if (x - self.px) ** 2 + (y - self.py) ** 2 <= R * R and self.los(self.px, self.py, x, y):
+                    self.vis.add((x, y))
+                    self.seen[y][x] = True
+        for e in self.en:
+            if (e['x'], e['y']) in self.vis:
+                e['awake'] = True
+
+    # ---- combat
+    def calc(self, base, tags, melee_weapon=False):
+        s = self.stats()
+        d = base + (s['weapon'] * 0.6 if melee_weapon else 0)
+        pct = s.get('dmg_pct', 0) + sum(s.get(t + '_pct', 0) for t in tags)
+        if 'pact' in self.buffs:
+            pct += 50
+        d *= max(0.1, 1 + pct / 100) * (1 + s.get('more_dmg', 0) / 100)
+        crit = self.rng.random() * 100 < 5 + s.get('crit', 0)
+        if crit:
+            d *= 2
+        return max(1, int(d)), crit
+
+    def hit(self, e, dmg, crit=False, src=''):
+        if e['hp'] <= 0:
+            return 0
+        e['hp'] -= dmg
+        e['awake'] = True
+        lc = self.st('leech')
+        if lc:
+            self.hp = min(self.st('hp'), self.hp + max(0, int(dmg * lc / 100)))
+        self.say(f'{src}{e["name"]} -{dmg}{"!" if crit else ""}' + (' (dies)' if e['hp'] <= 0 else ''))
+        if e['hp'] <= 0:
+            self.kill(e)
+        return dmg
+
+    def kill(self, e):
+        if e in self.en:
+            self.en.remove(e)
+        self.gain_xp(e['xp'])
+        if e['champ'] or self.rng.random() < 0.28:
+            for _ in range(3 if e['boss'] else 1):
+                self.drop(e['x'], e['y'], 2 if e['champ'] else 0)
+
+    def gain_xp(self, n):
+        self.xp += n
+        while self.xp >= int(18 * self.lvl ** 1.5):
+            self.xp -= int(18 * self.lvl ** 1.5)
+            self.lvl += 1
+            self.points += 1
+            self.hp = min(self.st('hp'), self.hp + self.st('hp') // 3)
+            self.say(f'LEVEL {self.lvl}! +1 passive point (T)')
+
+    def nearest(self, rng):
+        c = [e for e in self.en if (e['x'], e['y']) in self.vis and (e['x'] - self.px) ** 2 + (e['y'] - self.py) ** 2 <= rng * rng]
+        return min(c, key=lambda e: (e['x'] - self.px) ** 2 + (e['y'] - self.py) ** 2) if c else None
+
+    def adjacent(self):
+        return [e for e in self.en if max(abs(e['x'] - self.px), abs(e['y'] - self.py)) == 1]
+
+    def cast(self, idx):
+        if idx >= len(self.slots) or not self.slots[idx]:
+            return False
+        key = self.slots[idx]
+        sk = SKILLS[key]
+        if self.cd.get(key, 0) > 0:
+            self.say(f'{sk["name"]} cooling ({self.cd[key]})')
+            return False
+        if self.mana < sk['cost']:
+            self.say('Not enough mana')
+            return False
+        ok = getattr(self, 'sk_' + key)(sk)
+        if ok:
+            self.mana -= sk['cost']
+            self.cd[key] = sk['cd']
+        return ok
+
+    def sk_whirlwind(self, sk):
+        adj = self.adjacent()
+        if not adj:
+            self.say('Nothing adjacent')
+            return False
+        for e in adj:
+            d, c = self.calc(sk['base'], sk['tags'], True)
+            self.hit(e, d, c, 'Whirl: ')
+        return True
+
+    def sk_fireball(self, sk):
+        e = self.nearest(sk['rng'])
+        if not e:
+            self.say('No target')
+            return False
+        d, c = self.calc(sk['base'], sk['tags'])
+        self.hit(e, d, c, 'Fireball: ')
+        if e in self.en:
+            e['dots'].append((max(1, d // 4), 3))
+        return True
+
+    def sk_frost_nova(self, sk):
+        hit = [e for e in self.en if (e['x'] - self.px) ** 2 + (e['y'] - self.py) ** 2 <= 5]
+        if not hit:
+            self.say('Nothing in range')
+            return False
+        for e in hit:
+            d, c = self.calc(sk['base'], sk['tags'])
+            self.hit(e, d, c, 'Nova: ')
+            e['slow'] = 3
+        return True
+
+    def sk_blink(self, sk):
+        dx, dy = self.face
+        x, y = self.px, self.py
+        for _ in range(5):
+            nx, ny = x + dx, y + dy
+            if self.g[ny][nx] == '#' or self.enemy_at(nx, ny):
+                break
+            x, y = nx, ny
+        if (x, y) == (self.px, self.py):
+            self.say('Blocked')
+            return False
+        self.px, self.py = x, y
+        for e in self.adjacent():
+            d, c = self.calc(sk['base'], sk['tags'], True)
+            self.hit(e, d, c, 'Blink: ')
+        return True
+
+    def sk_chain_lightning(self, sk):
+        e = self.nearest(sk['rng'])
+        if not e:
+            self.say('No target')
+            return False
+        done, mult = [], 1.0
+        for _ in range(4):
+            if not e:
+                break
+            d, c = self.calc(sk['base'], sk['tags'])
+            done.append(e)
+            self.hit(e, int(d * mult), c, 'Arc: ')
+            mult *= 0.8
+            cand = [o for o in self.en if o not in done and (o['x'] - e['x']) ** 2 + (o['y'] - e['y']) ** 2 <= 16]
+            e = min(cand, key=lambda o: (o['x'] - e['x']) ** 2 + (o['y'] - e['y']) ** 2) if cand else None
+        return True
+
+    def sk_bone_spear(self, sk):
+        t = self.nearest(sk['rng'])
+        if not t:
+            self.say('No target')
+            return False
+        dx, dy = t['x'] - self.px, t['y'] - self.py
+        n = max(abs(dx), abs(dy))
+        hit = set()
+        for i in range(1, sk['rng'] + 1):
+            x, y = self.px + round(dx * i / n), self.py + round(dy * i / n)
+            if self.g[y][x] == '#':
+                break
+            e = self.enemy_at(x, y)
+            if e and id(e) not in hit:
+                hit.add(id(e))
+                d, c = self.calc(sk['base'], sk['tags'])
+                self.hit(e, d, c, 'Spear: ')
+        return True
+
+    def sk_poison_cloud(self, sk):
+        t = self.nearest(sk['rng'])
+        if not t:
+            self.say('No target')
+            return False
+        for e in [e for e in self.en if (e['x'] - t['x']) ** 2 + (e['y'] - t['y']) ** 2 <= 5]:
+            d, _ = self.calc(sk['base'], sk['tags'])
+            e['dots'].append((d, 5))
+            e['awake'] = True
+        self.say('Poison cloud blooms')
+        return True
+
+    def sk_soul_siphon(self, sk):
+        e = self.nearest(sk['rng'])
+        if not e:
+            self.say('No target')
+            return False
+        d, c = self.calc(sk['base'], sk['tags'])
+        got = self.hit(e, d, c, 'Siphon: ')
+        self.hp = min(self.st('hp'), self.hp + int(got * 0.4))
+        return True
+
+    def sk_blood_pact(self, sk):
+        cost = int(self.st('hp') * 0.12)
+        if self.hp <= cost + 1:
+            self.say('Too weak for the pact')
+            return False
+        self.hp -= cost
+        self.mana = min(self.st('mana'), self.mana + 20)
+        self.buffs['pact'] = 6
+        self.say('Blood Pact: +50% damage')
+        return True
+
+    # ---- movement & turn
+    def step(self, dx, dy):
+        self.face = (dx, dy)
+        nx, ny = self.px + dx, self.py + dy
+        if self.g[ny][nx] == '#':
+            return False
+        e = self.enemy_at(nx, ny)
+        if e:
+            d, c = self.calc(0, {'phys', 'melee'}, True)
+            self.hit(e, d, c, 'You: ')
+        else:
+            self.px, self.py = nx, ny
+            self.pickup()
+        return True
+
+    def descend(self):
+        if self.g[self.py][self.px] != '>':
+            self.say('No stairs here')
+            return False
+        self.new_level()
+        return True
+
+    def end_turn(self):
+        self.turn += 1
+        s = self.stats()
+        if self.turn % 2 == 0:
+            self.mana = min(s['mana'], self.mana + 1)
+        if self.turn % 10 == 0:
+            self.hp = min(s['hp'], self.hp + 1 + s.get('regen', 0))
+            self.mana = min(s['mana'], self.mana + s.get('mregen', 0))
+        for k in list(self.cd):
+            self.cd[k] = max(0, self.cd[k] - 1)
+        for k in list(self.buffs):
+            self.buffs[k] -= 1
+            if self.buffs[k] <= 0:
+                del self.buffs[k]
+        self.vision()
+        for e in list(self.en):
+            if e not in self.en:
+                continue
+            nd = []
+            for d, t in e['dots']:
+                e['hp'] -= d
+                if t > 1:
+                    nd.append((d, t - 1))
+            e['dots'] = nd
+            if e['hp'] <= 0:
+                self.say(f'{e["name"]} succumbs')
+                self.kill(e)
+                continue
+            if not e['awake']:
+                continue
+            if e['slow'] > 0:
+                e['slow'] -= 1
+                if self.turn % 2:
+                    continue
+            for _ in range(2 if 'fast' in e['fl'] else 1):
+                self.enemy_act(e)
+        if self.hp <= 0:
+            self.dead = True
+
+    def hurt(self, e, mult=1.0):
+        a = self.stats().get('armor', 0)
+        d = max(1, int(e['dmg'] * mult * (1 - a / (a + 30 + 8 * self.depth))))
+        self.hp -= d
+        self.say(f'{e["name"]} hits you -{d}')
+
+    def enemy_act(self, e):
+        dx, dy = self.px - e['x'], self.py - e['y']
+        dist = max(abs(dx), abs(dy))
+        if dist == 1:
+            self.hurt(e)
+        elif 'ranged' in e['fl'] and dist <= 6 and self.los(e['x'], e['y'], self.px, self.py):
+            self.hurt(e, 0.8)
+        elif dist <= 16:
+            sx, sy = (dx > 0) - (dx < 0), (dy > 0) - (dy < 0)
+            for mx, my in ([(sx, sy), (sx, 0), (0, sy)] if abs(dx) > abs(dy) else [(sx, sy), (0, sy), (sx, 0)]):
+                if (mx or my) and self.g[e['y'] + my][e['x'] + mx] != '#' and not self.enemy_at(e['x'] + mx, e['y'] + my) \
+                        and (e['x'] + mx, e['y'] + my) != (self.px, self.py):
+                    e['x'] += mx
+                    e['y'] += my
+                    break
+
+    # ---- passive tree
+    def frontier(self):
+        out = set()
+        for x, y in self.alloc:
+            for d in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                p = (x + d[0], y + d[1])
+                if p not in self.alloc:
+                    out.add(p)
+        return out
+
+    def take(self, p):
+        if self.points > 0 and p in self.frontier():
+            self.alloc.add(p)
+            self.points -= 1
+            self.hp = min(self.hp, self.st('hp'))
+            return True
+        return False
+
+    def equip_item(self, i):
+        it = self.pack[i]
+        old = self.equip[it['slot']]
+        self.equip[it['slot']] = it
+        self.pack.pop(i)
+        if old:
+            self.pack.append(old)
+        self.hp = min(self.hp, self.st('hp'))
+
+
+# =================== curses UI ===================
+def cp(n, bold=False):
+    return curses.color_pair(n) | (curses.A_BOLD if bold else 0)
+
+
+def put(win, y, x, s, a=0):
+    h, w = win.getmaxyx()
+    if 0 <= y < h and x < w:
+        try:
+            win.addstr(y, max(0, x), s[:w - x - (1 if y == h - 1 else 0)], a)
+        except curses.error:
+            pass
+
+
+def draw(win, g):
+    win.erase()
+    h, w = win.getmaxyx()
+    s = g.stats()
+    mh = h - 6
+    cx0 = min(max(0, g.px - w // 2), max(0, W - w))
+    cy0 = min(max(0, g.py - mh // 2), max(0, H - mh))
+    for sy in range(mh):
+        for sx in range(min(w - 1, W)):
+            x, y = cx0 + sx, cy0 + sy
+            if not (0 <= x < W and 0 <= y < H) or not g.seen[y][x]:
+                continue
+            t, v = g.g[y][x], (x, y) in g.vis
+            ch = '▓' if t == '#' else '▼' if t == '>' else '·'
+            col = cp(1) if t == '#' else cp(4, True) if t == '>' else cp(1)
+            put(win, sy + 2, sx, ch, col if v else curses.A_DIM)
+    for (x, y), its in g.items.items():
+        if (x, y) in g.vis:
+            it = its[-1]
+            put(win, y - cy0 + 2, x - cx0, '◈' if it['slot'] == 'gem' else '◆', cp(RCOL[it['rarity']], True))
+    for e in g.en:
+        if (e['x'], e['y']) in g.vis:
+            put(win, e['y'] - cy0 + 2, e['x'] - cx0, e['gl'], cp(2, True) if e['champ'] else cp(3 if e['slow'] else 2))
+    put(win, g.py - cy0 + 2, g.px - cx0, '@', cp(5, True))
+    bar = lambda v, m, n: '█' * int(n * max(0, v) / max(1, m)) + '░' * (n - int(n * max(0, v) / max(1, m)))
+    put(win, 0, 0, f'♥{g.hp}/{s["hp"]} ', cp(2, True))
+    put(win, 0, 9 + len(str(g.hp)) + len(str(s['hp'])), f'{bar(g.hp, s["hp"], 8)}', cp(2))
+    put(win, 1, 0, f'✦{g.mana}/{s["mana"]} {bar(g.mana, s["mana"], 8)}', cp(5))
+    put(win, 0, w - 18, f'Lv{g.lvl} ▼D{g.depth}' + (f' ✚{g.points}' if g.points else ''), cp(4, True))
+    xpn = int(18 * g.lvl ** 1.5)
+    put(win, 1, w - 18, f'xp {g.xp}/{xpn}', curses.A_DIM)
+    for i, m in enumerate(g.log[-3:]):
+        put(win, h - 5 + i, 0, m, curses.A_DIM if i < 2 else 0)
+    sb = ''
+    for i, k in enumerate(g.slots):
+        sk = SKILLS[k]
+        c = g.cd.get(k, 0)
+        sb += f'{i + 1}:{sk["name"][:9]}{"(" + str(c) + ")" if c else "":<3}{sk["cost"]} '
+    put(win, h - 2, 0, sb, cp(7))
+    put(win, h - 1, 0, 'hjkl/arrows move 1-4 skill i gear K skills t tree > stairs', curses.A_DIM)
+    win.refresh()
+
+
+KEYS = {ord('h'): (-1, 0), ord('l'): (1, 0), ord('k'): (0, -1), ord('j'): (0, 1), curses.KEY_LEFT: (-1, 0), curses.KEY_RIGHT: (1, 0),
+        curses.KEY_UP: (0, -1), curses.KEY_DOWN: (0, 1), ord('a'): (-1, 0), ord('d'): (1, 0), ord('w'): (0, -1), ord('s'): (0, 1)}
+
+
+def item_lines(g, it):
+    if it['slot'] == 'gem':
+        sk = SKILLS[it['skill']]
+        return [(f'Skill gem: {sk["name"]}', cp(7, True)), (sk['desc'], 0), ('Tags: ' + ' '.join(sorted(sk['tags'])), curses.A_DIM)]
+    out = [(it['name'], cp(RCOL[it['rarity']], True)), (f'{it["rarity"]} {it["slot"]} ilvl {it.get("ilvl", 1)}', curses.A_DIM)]
+    out += [('  ' + g.aff_text(k, v), 0) for k, v in it['aff']]
+    return out
+
+
+def menu_inv(win, g):
+    sel = 0
+    while True:
+        win.erase()
+        put(win, 0, 0, 'GEAR  enter=equip x=drop esc=back', cp(4, True))
+        y = 1
+        for slot, it in g.equip.items():
+            put(win, y, 0, f'[{slot[:3]}] ' + (it['name'] if it else '-'), cp(RCOL[it['rarity']]) if it else curses.A_DIM)
+            y += 1
+        y += 1
+        for i, it in enumerate(g.pack):
+            nm = ('Gem: ' + SKILLS[it['skill']]['name']) if it['slot'] == 'gem' else it['name']
+            put(win, y + i, 0, ('>' if i == sel else ' ') + nm, cp(RCOL[it['rarity']], i == sel))
+        if g.pack:
+            sel = min(sel, len(g.pack) - 1)
+            h, w = win.getmaxyx()
+            for j, (t, a) in enumerate(item_lines(g, g.pack[sel])):
+                put(win, h - 9 + j, 0, t, a)
+        win.refresh()
+        c = win.getch()
+        if c in (27, ord('q'), ord('i')):
+            return
+        if c in (curses.KEY_DOWN, ord('j')) and g.pack:
+            sel = (sel + 1) % len(g.pack)
+        elif c in (curses.KEY_UP, ord('k')) and g.pack:
+            sel = (sel - 1) % len(g.pack)
+        elif c in (10, 13) and g.pack:
+            if g.pack[sel]['slot'] != 'gem':
+                g.equip_item(sel)
+        elif c == ord('x') and g.pack:
+            g.pack.pop(sel)
+
+
+def menu_skills(win, g):
+    sel = 0
+    while True:
+        win.erase()
+        put(win, 0, 0, 'SKILLS  j/k pick, 1-4 = put in slot, esc', cp(4, True))
+        for i, k in enumerate(g.slots):
+            put(win, 1 + i, 0, f'{i + 1}: {SKILLS[k]["name"]}', cp(7, True))
+        for i, k in enumerate(g.known):
+            sk = SKILLS[k]
+            put(win, 6 + i, 0, ('>' if i == sel else ' ') + f'{sk["name"]} ({sk["cost"]}mp)' + (' *' if k in g.slots else ''), cp(7 if k in g.slots else 1, i == sel))
+        sk = SKILLS[g.known[sel]]
+        h, w = win.getmaxyx()
+        put(win, h - 3, 0, sk['desc'])
+        put(win, h - 2, 0, 'tags: ' + ' '.join(sorted(sk['tags'])), curses.A_DIM)
+        win.refresh()
+        c = win.getch()
+        if c in (27, ord('q')):
+            return
+        if c in (curses.KEY_DOWN, ord('j')):
+            sel = (sel + 1) % len(g.known)
+        elif c in (curses.KEY_UP, ord('k')):
+            sel = (sel - 1) % len(g.known)
+        elif ord('1') <= c <= ord('4'):
+            k = g.known[sel]
+            i = c - ord('1')
+            if k in g.slots:
+                j = g.slots.index(k)
+                g.slots[j], g.slots[i] = g.slots[i], g.slots[j]
+            else:
+                g.slots[i] = k
+
+
+def menu_tree(win, g):
+    cx, cy = 0, 0
+    while True:
+        win.erase()
+        h, w = win.getmaxyx()
+        put(win, 0, 0, f'TREE  points:{g.points}  arrows move, enter=take, esc', cp(4, True))
+        fr = g.frontier()
+        for sy in range(1, h - 5):
+            for sx in range(0, w - 1, 2):
+                y = cy + (sy - h // 2 + 2) // 2
+                if (sy - h // 2 + 2) % 2 or (sx - w // 2) % 4:
+                    continue
+                x = cx + (sx - w // 2) // 4
+                if (x, y) in g.alloc:
+                    ch, a = '◉', cp(3, True)
+                elif (x, y) in fr:
+                    n = node_at(g.seed, x, y)
+                    ch = {'minor': '○', 'notable': '◈', 'key': '★'}[n['kind']]
+                    a = cp(7 if n['kind'] == 'minor' else 4 if n['kind'] == 'notable' else 6, True)
+                else:
+                    ch, a = '·', curses.A_DIM
+                if (x, y) == (cx, cy):
+                    a |= curses.A_REVERSE
+                put(win, sy, sx, ch, a)
+        n = node_at(g.seed, cx, cy)
+        state = 'taken' if (cx, cy) in g.alloc else 'available' if (cx, cy) in fr else 'unreachable'
+        put(win, h - 4, 0, f'{n["name"]} [{n["kind"]}] {state}', cp(4, True))
+        put(win, h - 3, 0, ', '.join(g.aff_text(k, v) for k, v in n['stats'].items()))
+        win.refresh()
+        c = win.getch()
+        if c in (27, ord('q'), ord('t')):
+            return
+        if c in KEYS:
+            cx += KEYS[c][0]
+            cy += KEYS[c][1]
+        elif c in (10, 13):
+            if not g.take((cx, cy)):
+                g.say('Cannot take that')
+
+
+def run(win):
+    curses.curs_set(0)
+    curses.start_color()
+    curses.use_default_colors()
+    for i, c in enumerate([curses.COLOR_WHITE, curses.COLOR_RED, curses.COLOR_GREEN, curses.COLOR_YELLOW, curses.COLOR_BLUE,
+                           curses.COLOR_MAGENTA, curses.COLOR_CYAN], 1):
+        curses.init_pair(i, c, -1)
+    win.keypad(True)
+    g = Game()
+    while True:
+        draw(win, g)
+        c = win.getch()
+        used = False
+        if c == ord('Q'):
+            return
+        if c in KEYS:
+            used = g.step(*KEYS[c])
+        elif ord('1') <= c <= ord('4'):
+            used = g.cast(c - ord('1'))
+        elif c in (ord('.'), ord(' ')):
+            used = True
+        elif c in (ord('>'), 10, 13):
+            used = g.descend()
+        elif c == ord('i'):
+            menu_inv(win, g)
+        elif c == ord('K'):
+            menu_skills(win, g)
+        elif c == ord('t'):
+            menu_tree(win, g)
+        if used:
+            g.end_turn()
+        if g.dead:
+            win.erase()
+            put(win, 2, 2, f'YOU DIED on depth {g.depth}, level {g.lvl}.', cp(2, True))
+            put(win, 4, 2, 'any key: new run   Q: quit')
+            win.refresh()
+            if win.getch() == ord('Q'):
+                return
+            g = Game()
+
+
+if __name__ == '__main__':
+    try:
+        locale.setlocale(locale.LC_ALL, '')
+    except locale.Error:
+        locale.setlocale(locale.LC_ALL, 'C.UTF-8')
+    curses.wrapper(run)
