@@ -122,7 +122,7 @@ class GridWin:
             elif ch != ' ':
                 g = a.glyphs.glyph(ch, fg, 26)
                 a.screen.blit(g, (px + (self.cw - g.get_width()) // 2, py + (self.chh - g.get_height()) // 2))
-        pygame.display.flip()
+        a.present()
 
     def draw_line_char(self, scr, ch, fg, px, py):
         cw, chh = self.cw, self.chh
@@ -170,9 +170,13 @@ class App:
             self.screen = pygame.display.set_mode((w, h))
         else:
             self.screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+        self.display = self.screen
         pygame.display.set_caption('glyphfall')
         pygame.mouse.set_visible(bool(win))
-        self.W, self.H = self.screen.get_size()
+        self.W, self.H = self.display.get_size()
+        # draw on an opaque canvas: the Wayland window surface carries alpha, and alpha blits onto it
+        # would leave the compositor blending the window with whatever is behind it
+        self.screen = pygame.Surface((self.W, self.H)).convert()
         self.nav = int(os.environ.get('GF_NAV', '0' if win else '80'))  # the phone's nav bar overlays the bottom
         self.UH = self.H - self.nav
         self.T = max(24, self.UH // 19)
@@ -232,6 +236,10 @@ class App:
             kind = {pygame.MOUSEBUTTONDOWN: 'down', pygame.MOUSEBUTTONUP: 'up', pygame.MOUSEMOTION: 'move'}[t]
             return (kind, ('m',), e.pos[0], e.pos[1])
         return None
+
+    def present(self):
+        self.display.blit(self.screen, (0, 0))
+        pygame.display.flip()
 
     def quit(self):
         self.g.save()
@@ -690,7 +698,7 @@ class App:
                 self.landing()
             self.update(dt)
             self.draw()
-            pygame.display.flip()
+            self.present()
             self.clock.tick(60)
 
 
