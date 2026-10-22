@@ -179,7 +179,7 @@ def node_at_skill(seed, key, x, y):
 
 
 class Game:
-    streak = streak_t = pact_extra = last_dmg = 0
+    streak = streak_t = pact_extra = last_dmg = fcount = fscrap = 0
     flag_reset = _boom = phoenix = False
     extra_tags = frozenset()
     ms = {}
@@ -199,6 +199,7 @@ class Game:
         self.cons, self.keys, self.res = {'hp': 2, 'mp': 1}, 0, {'scrap': 0, 'essence': 0}
         self.mastery = {}
         self.chests, self.potion_cd = {}, 0
+        self.filter = {'normal': 'salvage', 'magic': 'keep', 'rare': 'keep'}
         self.ms, self.cur = {}, None
         self.face = (1, 0)
         self.turn = 0
@@ -213,7 +214,7 @@ class Game:
                  equip=self.equip, pack=self.pack, known=self.known, slots=self.slots, hp=self.hp, mana=self.mana, turn=self.turn,
                  best=getattr(self, 'best', self.depth), deaths=getattr(self, 'deaths', 0),
                  mastery={k: dict(m, alloc=sorted(m['alloc'])) for k, m in self.mastery.items()},
-                 cons=self.cons, keys=self.keys, res=self.res)
+                 cons=self.cons, keys=self.keys, res=self.res, filter=self.filter)
         os.makedirs(os.path.dirname(SAVE), exist_ok=True)
         with open(SAVE + '.tmp', 'w') as f:
             json.dump(d, f)
@@ -235,6 +236,7 @@ class Game:
         g.ms, g.cur = {}, None
         g.cons, g.keys, g.res = d.get('cons', {'hp': 2, 'mp': 1}), d.get('keys', 0), d.get('res', {'scrap': 0, 'essence': 0})
         g.potion_cd, g.chests = 0, {}
+        g.filter = d.get('filter', {'normal': 'salvage', 'magic': 'keep', 'rare': 'keep'})
         g.face, g.turn, g.dead = (1, 0), d['turn'], False
         g.depth = d['depth'] - 1
         g.best, g.deaths = d.get('best', d['depth']), d.get('deaths', 0)
@@ -303,6 +305,9 @@ class Game:
 
     # ---- level gen
     def new_level(self):
+        if self.fcount:
+            self.say(f'Filter: {self.fcount} items cleared (+{self.fscrap} scrap)')
+            self.fcount = self.fscrap = 0
         self.depth += 1
         self.phoenix = False
         self.best = max(getattr(self, 'best', 0), self.depth)
@@ -372,6 +377,33 @@ class Game:
         return next((e for e in self.en if e['x'] == x and e['y'] == y), None)
 
     # ---- loot
+    def apply_filter(self, it):
+        """True if the filter consumed the item (auto-salvaged or hidden). Legendary+ and uniques are never filtered."""
+        act = self.filter.get(it['rarity'], 'keep')
+        if act == 'keep':
+            return False
+        if act == 'salvage':
+            sc, es = self.salvage_value(it)
+            self.res['scrap'] += sc
+            self.res['essence'] += es
+            self.fscrap += sc
+        self.fcount += 1
+        return True
+
+    def sweep(self):
+        n = sc0 = 0
+        for i in range(len(self.pack) - 1, -1, -1):
+            it = self.pack[i]
+            act = self.filter.get(it['rarity'], 'keep')
+            if act == 'salvage':
+                sc0 += self.salvage_value(it)[0]
+                self.salvage(i)
+                n += 1
+            elif act == 'hide':
+                self.pack.pop(i)
+                n += 1
+        return n, sc0
+
     def drop(self, x, y, bonus):
         find = 1 + self.st('find') / 100
         roll = self.rng.random()
@@ -379,6 +411,8 @@ class Game:
             it = dict(slot='gem', skill=self.rng.choice(list(SKILLS)), rarity='magic')
         else:
             it = self.make_item(self.depth, bonus, find)
+            if self.apply_filter(it):
+                return
         self.items.setdefault((x, y), []).append(it)
 
     def roll_affixes(self, slot, rar, ilvl):
@@ -504,11 +538,13 @@ class Game:
         self.keys -= 1
         del self.chests[(x, y)]
         for _ in range(self.rng.randint(2, 3)):
-            self.items.setdefault((x, y), []).append(self.make_item(self.depth, 3, 1 + self.st('find') / 100))
+            it = self.make_item(self.depth, 3, 1 + self.st('find') / 100)
+            if not self.apply_filter(it):
+                self.items.setdefault((x, y), []).append(it)
         if self.rng.random() < 0.08:
             self.drop_unique(x, y)
         if self.rng.random() < 0.5:
-            self.items[(x, y)].append(dict(slot='cons', kind=self.rng.choice(['rejuv', 'hp', 'mp', 'map']), rarity='magic'))
+            self.items.setdefault((x, y), []).append(dict(slot='cons', kind=self.rng.choice(['rejuv', 'hp', 'mp', 'map']), rarity='magic'))
         self.res['scrap'] += 5 * self.depth
         self.say('The chest bursts open!')
         return True
@@ -1305,6 +1341,54 @@ def bag_entries(g, tab):
                  lines=[('Essence', cp(6, True)), ('From champions, bosses, legendary+ salvage.', 0), ('Needed for rerolling legendary+ gear and Ascend (40).', dim), (f'You have {g.res["essence"]}', dim)])]
 
 
+FMODES = ['keep', 'salvage', 'hide']
+FNAME = {'keep': 'KEEP', 'salvage': 'AUTO-SALVAGE', 'hide': 'HIDE'}
+FDESC = {'keep': 'Drops on the floor for you to pick up.',
+         'salvage': 'Never drops. Instantly becomes scrap.',
+         'hide': 'Never drops. Gone, no scrap.'}
+
+
+def menu_filter(win, g):
+    armed = False
+    while True:
+        win.erase()
+        h, w = win.getmaxyx()
+        btns = []
+        put(win, 0, 0, 'LOOT FILTER   tap a rarity to cycle. Legendary, mythic, unique, gems, keys, potions are never filtered.', cp(4, True))
+        rows = [('normal', 'Normal'), ('magic', 'Magic'), ('rare', 'Rare')]
+        for i, (r, lab) in enumerate(rows):
+            act = g.filter.get(r, 'keep')
+            button(win, btns, 2 + 4 * i, 1, 4, w // 2 - 2, [f'{lab}: {FNAME[act]}', FDESC[act][:w // 2 - 6]],
+                   ord(r[0]), cp(RCOL[r], True) if act == 'keep' else curses.A_DIM)
+        n = sum(1 for it in g.pack if g.filter.get(it['rarity'], 'keep') != 'keep')
+        put(win, 2, w // 2 + 1, f'{n} item(s) in your bag match a clearing rule.')
+        put(win, 3, w // 2 + 1, 'Sweep applies the rules to the bag now.' if not armed else 'Press Sweep again to confirm.', cp(4, True) if armed else curses.A_DIM)
+        button(win, btns, 5, w // 2 + 1, 3, 16, ['Sweep now'], ord('s'), cp(2, True) if armed else curses.A_DIM)
+        put(win, 9, w // 2 + 1, 'Changes apply to future drops at once.', curses.A_DIM)
+        put(win, h - 4, 0, g.log[-1] if g.log else '', 0)
+        button(win, btns, h - 3, 0, 3, w, ['Back'], 27, curses.A_DIM)
+        win.refresh()
+        c = getin(win, btns)
+        if c == -1 or isinstance(c, tuple):
+            continue
+        if c != ord('s'):
+            armed = False
+        if c in (27, ord('q'), ord('f')):
+            return
+        for r, _ in rows:
+            if c == ord(r[0]):
+                g.filter[r] = FMODES[(FMODES.index(g.filter.get(r, 'keep')) + 1) % 3]
+        if c == ord('s'):
+            if not n:
+                g.say('Nothing to sweep')
+            elif not armed:
+                armed = True
+            else:
+                armed = False
+                k, sc = g.sweep()
+                g.say(f'Swept {k} items (+{sc} scrap)')
+
+
 def menu_inv(win, g):
     tab, sel, last_tap, armed = 0, 0, None, None
     while True:
@@ -1362,7 +1446,7 @@ def menu_inv(win, g):
             defs += [('Equip', 10), ('Salvage', ord('v')), ('Reroll', ord('r')), ('Ascend', ord('a'))]
         elif e and e['kind'] == 'cons':
             defs += [('Use', 10)]
-        defs.append(('Back', 27))
+        defs += [('Filter', ord('f')), ('Back', 27)]
         bw = w // len(defs)
         for i, (lab, key) in enumerate(defs):
             button(win, btns, h - 3, i * bw, 3, bw, [lab], key, curses.A_DIM)
@@ -1385,6 +1469,9 @@ def menu_inv(win, g):
                 continue
         if c in (27, ord('q'), ord('i')):
             return
+        if c == ord('f'):
+            menu_filter(win, g)
+            continue
         if c in (curses.KEY_LEFT, ord('h')):
             sel = max(0, sel - 1)
         elif c in (curses.KEY_RIGHT, ord('l')):
