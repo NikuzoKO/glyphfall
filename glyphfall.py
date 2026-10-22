@@ -103,6 +103,15 @@ ELABEL = {'more_dmg': '+{}% More Damage', 'hp_mult': '{:+}% Max Life', 'sk_dmg':
           'bp_cheap': 'costs half the life', 'bp_long': 'lasts {} more turns', 'bp_power': 'buff +{}% stronger'}
 
 
+SLOTNAME = {'weapon': 'Weapon', 'armor': 'Armor', 'charm': 'Amulet'}
+CONS = {'hp': ('Health Potion', 'Heal 40% of max life'), 'mp': ('Mana Potion', 'Restore 60% of max mana'),
+        'rejuv': ('Rejuvenation', 'Heal and restore 50% of both'), 'map': ('Map Scroll', 'Reveal the whole level')}
+SALVAGE = {'normal': 2, 'magic': 5, 'rare': 14, 'legend': 60, 'mythic': 200, 'unique': 120}
+ESS = {'legend': 3, 'mythic': 12, 'unique': 8}
+REROLL_SCRAP = {'magic': 10, 'rare': 30, 'legend': 120, 'mythic': 300, 'unique': 200}
+REROLL_ESS = {'legend': 5, 'mythic': 15, 'unique': 10}
+
+
 def tuple_aff(it):
     if 'aff' in it:
         it['aff'] = [tuple(a) for a in it['aff']]
@@ -187,7 +196,9 @@ class Game:
         self.known = list(START_SKILLS)
         self.slots = list(START_SKILLS)
         self.cd, self.buffs, self.log = {}, {}, []
+        self.cons, self.keys, self.res = {'hp': 2, 'mp': 1}, 0, {'scrap': 0, 'essence': 0}
         self.mastery = {}
+        self.chests, self.potion_cd = {}, 0
         self.ms, self.cur = {}, None
         self.face = (1, 0)
         self.turn = 0
@@ -201,7 +212,8 @@ class Game:
         d = dict(seed=self.seed, depth=self.depth, lvl=self.lvl, xp=self.xp, points=self.points, alloc=sorted(self.alloc),
                  equip=self.equip, pack=self.pack, known=self.known, slots=self.slots, hp=self.hp, mana=self.mana, turn=self.turn,
                  best=getattr(self, 'best', self.depth), deaths=getattr(self, 'deaths', 0),
-                 mastery={k: dict(m, alloc=sorted(m['alloc'])) for k, m in self.mastery.items()})
+                 mastery={k: dict(m, alloc=sorted(m['alloc'])) for k, m in self.mastery.items()},
+                 cons=self.cons, keys=self.keys, res=self.res)
         os.makedirs(os.path.dirname(SAVE), exist_ok=True)
         with open(SAVE + '.tmp', 'w') as f:
             json.dump(d, f)
@@ -221,6 +233,8 @@ class Game:
         g.cd, g.buffs, g.log = {}, {}, []
         g.mastery = {k: dict(m, alloc={tuple(p) for p in m['alloc']}) for k, m in d.get('mastery', {}).items()}
         g.ms, g.cur = {}, None
+        g.cons, g.keys, g.res = d.get('cons', {'hp': 2, 'mp': 1}), d.get('keys', 0), d.get('res', {'scrap': 0, 'essence': 0})
+        g.potion_cd, g.chests = 0, {}
         g.face, g.turn, g.dead = (1, 0), d['turn'], False
         g.depth = d['depth'] - 1
         g.best, g.deaths = d.get('best', d['depth']), d.get('deaths', 0)
@@ -327,6 +341,12 @@ class Game:
                     self.spawn(ex, ey, r)
             if r.random() < 0.35:
                 self.drop(r.randint(x, x + w - 1), r.randint(y, y + h - 1), 0)
+        self.chests = {}
+        if len(rooms) > 3 and r.random() < 0.6:
+            x, y, w, h = r.choice(rooms[2:-1])
+            cxy = (r.randint(x, x + w - 1), r.randint(y, y + h - 1))
+            if not self.enemy_at(*cxy) and g[cxy[1]][cxy[0]] == '.':
+                self.chests[cxy] = True
         if boss:
             e = self.spawn(sx - 1, sy, r, boss=True)
         self.say(f'-- Depth {self.depth} --' + ('  A presence guards the stairs.' if boss else ''))
@@ -361,11 +381,8 @@ class Game:
             it = self.make_item(self.depth, bonus, find)
         self.items.setdefault((x, y), []).append(it)
 
-    def make_item(self, ilvl, bonus, find=1):
+    def roll_affixes(self, slot, rar, ilvl):
         r = self.rng
-        x = r.random() / (find * (1 + bonus * 0.4)) ** 0.5
-        rar = 'mythic' if x < 0.0015 and ilvl >= 6 else 'legend' if x < 0.012 else 'rare' if x < 0.10 else 'magic' if x < 0.40 else 'normal'
-        slot = r.choice(['weapon', 'armor', 'charm'])
         n = {'normal': 0, 'magic': r.randint(1, 2), 'rare': r.randint(3, 4), 'legend': r.randint(5, 6), 'mythic': r.randint(6, 7)}[rar]
         aff, used = [], set()
         sc = (1 + 0.08 * ilvl) * (1.5 ** ((ilvl - 1) // 10)) * (1.4 if rar == 'mythic' else 1)
@@ -379,6 +396,14 @@ class Game:
                 continue
             used.add(a[0])
             aff.append((a[0], max(1, int(r.uniform(a[2], a[3]) * sc))))
+        return aff
+
+    def make_item(self, ilvl, bonus, find=1):
+        r = self.rng
+        x = r.random() / (find * (1 + bonus * 0.4)) ** 0.5
+        rar = 'mythic' if x < 0.0015 and ilvl >= 6 else 'legend' if x < 0.012 else 'rare' if x < 0.10 else 'magic' if x < 0.40 else 'normal'
+        slot = r.choice(['weapon', 'armor', 'charm'])
+        aff = self.roll_affixes(slot, rar, ilvl)
         base = r.choice(BASES[slot])
         name = base if rar == 'normal' else f'{r.choice(PRE)} {base}' if rar == 'magic' else \
             f'{r.choice(RARE_A)}{r.choice(RARE_B).lower()} {base}' if rar == 'rare' else \
@@ -387,6 +412,106 @@ class Game:
         if rar in ('legend', 'mythic'):
             it['power'], it['rank'] = r.choice(LEGEND_POWERS), 2 if rar == 'mythic' else 1
         return it
+
+    # ---- bag economy: salvage, reroll (refits to current depth), ascend legend -> mythic, consumables, chests
+    def salvage_value(self, it):
+        k = 1 + it.get('ilvl', 1) / 10
+        return int(SALVAGE[it['rarity']] * k), int(ESS.get(it['rarity'], 0) * k)
+
+    def reroll_cost(self, it):
+        if it['rarity'] == 'normal':
+            return None
+        k = 1 + self.depth / 10
+        return int(REROLL_SCRAP[it['rarity']] * k), REROLL_ESS.get(it['rarity'], 0)
+
+    def salvage(self, i):
+        it = self.pack.pop(i)
+        sc, es = self.salvage_value(it)
+        self.res['scrap'] += sc
+        self.res['essence'] += es
+        self.say(f'Salvaged {it["name"]}: +{sc} scrap' + (f' +{es} essence' if es else ''))
+
+    def pay(self, scrap, ess):
+        if self.res['scrap'] < scrap or self.res['essence'] < ess:
+            self.say(f'Need {scrap} scrap' + (f' + {ess} essence' if ess else ''))
+            return False
+        self.res['scrap'] -= scrap
+        self.res['essence'] -= ess
+        return True
+
+    def reroll(self, i):
+        it = self.pack[i]
+        cost = self.reroll_cost(it)
+        if not cost:
+            self.say('Normal gear is not worth it')
+            return False
+        if not self.pay(*cost):
+            return False
+        if it['rarity'] == 'unique':
+            u = next(u for u in UNIQUES if u['name'] == it['name'])
+            sc = (1 + 0.08 * self.depth) * (1.5 ** ((self.depth - 1) // 10))
+            it['aff'] = [(k, max(1, int(v * sc))) for k, v in u['base'].items()]
+        else:
+            it['aff'] = self.roll_affixes(it['slot'], it['rarity'], self.depth)
+        it['ilvl'] = self.depth
+        self.say(f'Reforged {it["name"]} for depth {self.depth}')
+        return True
+
+    def ascend(self, i):
+        it = self.pack[i]
+        if it['rarity'] != 'legend':
+            self.say('Only legendary gear ascends')
+            return False
+        k = 1 + self.depth / 10
+        if not self.pay(int(400 * k), 40):
+            return False
+        it['rarity'], it['rank'] = 'mythic', 2
+        it['name'] = '☀ Mythic ' + it['name'][2:]
+        it['ilvl'] = self.depth
+        it['aff'] = self.roll_affixes(it['slot'], 'mythic', self.depth)
+        self.say(f'ASCENDED: {it["name"]}')
+        return True
+
+    def use_cons(self, kind):
+        if self.cons.get(kind, 0) <= 0:
+            self.say(f'No {CONS[kind][0]}')
+            return False
+        if kind != 'map' and self.potion_cd > 0:
+            self.say(f'Potion sickness ({self.potion_cd})')
+            return False
+        mh, mm = self.st('hp'), self.st('mana')
+        if kind == 'hp':
+            self.hp = min(mh, self.hp + int(mh * 0.4))
+        elif kind == 'mp':
+            self.mana = min(mm, self.mana + int(mm * 0.6))
+        elif kind == 'rejuv':
+            self.hp = min(mh, self.hp + mh // 2)
+            self.mana = min(mm, self.mana + mm // 2)
+        else:
+            self.seen = [[True] * W for _ in range(H)]
+            for e in self.en:
+                e['awake'] = False
+        self.cons[kind] -= 1
+        if kind != 'map':
+            self.potion_cd = 6
+        self.say(f'Used {CONS[kind][0]}')
+        return True
+
+    def open_chest(self, x, y):
+        if self.keys <= 0:
+            self.say('Locked chest. Needs a key (champions and bosses carry them).')
+            return False
+        self.keys -= 1
+        del self.chests[(x, y)]
+        for _ in range(self.rng.randint(2, 3)):
+            self.items.setdefault((x, y), []).append(self.make_item(self.depth, 3, 1 + self.st('find') / 100))
+        if self.rng.random() < 0.08:
+            self.drop_unique(x, y)
+        if self.rng.random() < 0.5:
+            self.items[(x, y)].append(dict(slot='cons', kind=self.rng.choice(['rejuv', 'hp', 'mp', 'map']), rarity='magic'))
+        self.res['scrap'] += 5 * self.depth
+        self.say('The chest bursts open!')
+        return True
 
     def make_unique(self):
         have = {i['name'] for i in self.pack} | {i['name'] for i in self.equip.values() if i}
@@ -415,9 +540,12 @@ class Game:
                 else:
                     self.known.append(sk)
                     self.say(f'LEARNED {SKILLS[sk]["name"]}! (K to slot it)')
-            elif len(self.pack) >= 24:
-                self.say('Pack full.')
-                self.items.setdefault((self.px, self.py), []).append(it)
+            elif it['slot'] == 'cons':
+                self.cons[it['kind']] = self.cons.get(it['kind'], 0) + 1
+                self.say(f'Picked up {CONS[it["kind"]][0]}')
+            elif it['slot'] == 'key':
+                self.keys += 1
+                self.say('Picked up a Dungeon Key')
             else:
                 self.pack.append(it)
                 self.say(f'Picked up {it["name"]}')
@@ -514,6 +642,16 @@ class Game:
                 o['dots'] += list(e['dots'])
                 o['spread'], o['awake'] = True, True
         self.gain_xp(e['xp'])
+        r = self.rng
+        self.res['scrap'] += int((1 + self.depth * 0.6) * (5 if e['boss'] else 2 if e['champ'] else 1) * (1 if r.random() < 0.6 else 0))
+        if e['champ']:
+            self.res['essence'] += (6 + self.depth // 5) if e['boss'] else (1 + self.depth // 12)
+        nk = 2 if e['boss'] else 1 if e['champ'] and r.random() < 0.6 else 1 if r.random() < 0.02 else 0
+        for _ in range(nk):
+            self.items.setdefault((e['x'], e['y']), []).append(dict(slot='key', rarity='rare'))
+        if r.random() < 0.12:
+            k = r.choices(['hp', 'mp', 'rejuv', 'map'], [45, 35, 8, 12])[0]
+            self.items.setdefault((e['x'], e['y']), []).append(dict(slot='cons', kind=k, rarity='magic'))
         if e['boss'] and self.rng.random() < 0.6 or e['champ'] and self.rng.random() < 0.03 or self.rng.random() < 0.003:
             self.drop_unique(e['x'], e['y'])
         if e['champ'] or self.rng.random() < 0.28:
@@ -817,6 +955,8 @@ class Game:
         nx, ny = self.px + dx, self.py + dy
         if self.g[ny][nx] == '#':
             return False
+        if (nx, ny) in self.chests:
+            return self.open_chest(nx, ny)
         e = self.enemy_at(nx, ny)
         if e:
             d, c = self.calc(0, {'phys', 'melee'}, True)
@@ -847,6 +987,7 @@ class Game:
             self.buffs[k] -= 1
             if self.buffs[k] <= 0:
                 del self.buffs[k]
+        self.potion_cd = max(0, self.potion_cd - 1)
         if self.streak_t > 0:
             self.streak_t -= 1
             if not self.streak_t:
@@ -1071,7 +1212,10 @@ def draw(win, g, btns, touch):
     for (x, y), its in g.items.items():
         if (x, y) in g.vis and inside(y - cy0, x - cx0):
             it = its[-1]
-            put(win, y - cy0 + my0, x - cx0 + mx0, '◈' if it['slot'] == 'gem' else '◆', cp(RCOL[it['rarity']], True))
+            put(win, y - cy0 + my0, x - cx0 + mx0, {'gem': '◈', 'cons': '!', 'key': '⚷'}.get(it['slot'], '◆'), cp(RCOL[it['rarity']], True))
+    for (x, y) in g.chests:
+        if g.seen[y][x] and inside(y - cy0, x - cx0):
+            put(win, y - cy0 + my0, x - cx0 + mx0, '▣', cp(4, True))
     for e in g.en:
         if (e['x'], e['y']) in g.vis and inside(e['y'] - cy0, e['x'] - cx0):
             put(win, e['y'] - cy0 + my0, e['x'] - cx0 + mx0, e['gl'], cp(2, True) if e['champ'] else cp(3 if e['slow'] else 2))
@@ -1081,6 +1225,7 @@ def draw(win, g, btns, touch):
     put(win, 1, 0, f'✦{g.mana}/{s["mana"]} {bar(g.mana, s["mana"], 10)}', cp(5))
     put(win, 0, w - 22, f'Lv{g.lvl} ▼D{g.depth}' + (f' ✚{g.points}' if g.points else ''), cp(4, True))
     put(win, 1, w - 22, f'xp {g.xp}/{int(18 * g.lvl ** 1.5)}  {getattr(g, "clock", "")}', curses.A_DIM)
+    put(win, 2, w - PANEL if touch else w - 22, f'⚙{g.res["scrap"]} ✧{g.res["essence"]} ⚷{g.keys}', curses.A_DIM)
     nlog = 2 if touch else 3
     for i, m in enumerate(g.log[-nlog:]):
         put(win, h - nlog - (0 if touch else 2) + i, 0, m, curses.A_DIM if i < nlog - 1 else 0)
@@ -1089,6 +1234,8 @@ def draw(win, g, btns, touch):
         for r, row in enumerate(PAD):
             for c, (lab, key) in enumerate(row):
                 button(win, btns, y0 + 3 * r, 1 + 6 * c, 3, 6, [lab], key, curses.A_DIM if key != ord('.') else 0)
+        button(win, btns, 2, 1, 3, 9, [f'HP x{g.cons.get("hp", 0)}'], ord('p'), cp(2, True) if g.cons.get('hp') and not g.potion_cd else curses.A_DIM)
+        button(win, btns, 2, 10, 3, 9, [f'MP x{g.cons.get("mp", 0)}'], ord('o'), cp(5, True) if g.cons.get('mp') and not g.potion_cd else curses.A_DIM)
         y1 = h - 2 - 11
         for i, k in enumerate(g.slots):
             sk = SKILLS[k]
@@ -1108,7 +1255,7 @@ def draw(win, g, btns, touch):
             c = g.cd.get(k, 0)
             sb += f'{i + 1}:{sk["name"][:9]}{"(" + str(c) + ")" if c else "":<3}{g.eff_cost(k)} '
         put(win, h - 2, 0, sb, cp(7))
-        put(win, h - 1, 0, 'hjklyubn/arrows move 1-4 skill i gear K skills t tree > stairs', curses.A_DIM)
+        put(win, h - 1, 0, 'hjklyubn move 1-4 skill i bag K skills t tree p/o potions > stairs', curses.A_DIM)
     win.refresh()
 
 
@@ -1121,7 +1268,7 @@ def item_lines(g, it):
     if it['slot'] == 'gem':
         sk = SKILLS[it['skill']]
         return [(f'Skill gem: {sk["name"]}', cp(7, True)), (sk['desc'], 0), ('Tags: ' + ' '.join(sorted(sk['tags'])), curses.A_DIM)]
-    out = [(it['name'], cp(RCOL[it['rarity']], True)), (f'{it["rarity"]} {it["slot"]} ilvl {it.get("ilvl", 1)}', curses.A_DIM)]
+    out = [(it['name'], cp(RCOL[it['rarity']], True)), (f'{it["rarity"]} {SLOTNAME[it["slot"]]} ilvl {it.get("ilvl", 1)}', curses.A_DIM)]
     out += [('  ' + g.aff_text(k, v), 0) for k, v in it['aff']]
     if it.get('power'):
         nm, fn = POWER_TEXT[it['power']]
@@ -1134,51 +1281,141 @@ def scroll_top(sel, avail, n):
     return max(0, min(sel - avail + 1, n - avail)) if sel >= avail else 0
 
 
+TABS = [('Weap', 'weapon'), ('Armor', 'armor'), ('Amulet', 'charm'), ('Items', 'cons'), ('Keys', 'key'), ('Res', 'res')]
+PAGE = 16
+
+
+def bag_entries(g, tab):
+    kind = TABS[tab][1]
+    dim = curses.A_DIM
+    if kind in SLOTNAME:
+        return [dict(kind='gear', idx=i, it=it, label=it['name'], attr=cp(RCOL[it['rarity']], True))
+                for i, it in enumerate(g.pack) if it['slot'] == kind]
+    if kind == 'cons':
+        return [dict(kind='cons', key=k, label=f'{CONS[k][0]} x{g.cons.get(k, 0)}', attr=cp(4, True) if g.cons.get(k) else dim,
+                     lines=[(CONS[k][0], cp(4, True)), (CONS[k][1], 0), (f'You have {g.cons.get(k, 0)}. Main screen: p = HP, o = MP', dim)])
+                for k in CONS]
+    if kind == 'key':
+        return [dict(kind='key', label=f'Key x{g.keys}', attr=cp(4, True) if g.keys else dim,
+                     lines=[('Dungeon Key', cp(4, True)), ('Walk into a locked chest (▣) to open it.', 0), ('Chests hold 2-3 better items.', dim),
+                            ('Champions and bosses carry keys.', dim), (f'You have {g.keys}', dim)])]
+    return [dict(kind='res', label=f'Scrap x{g.res["scrap"]}', attr=cp(1, True),
+                 lines=[('Scrap', cp(1, True)), ('From kills and salvage.', 0), ('Pays for Reroll (refits gear to this depth) and Ascend.', dim), (f'You have {g.res["scrap"]}', dim)]),
+            dict(kind='res', label=f'Essence x{g.res["essence"]}', attr=cp(6, True),
+                 lines=[('Essence', cp(6, True)), ('From champions, bosses, legendary+ salvage.', 0), ('Needed for rerolling legendary+ gear and Ascend (40).', dim), (f'You have {g.res["essence"]}', dim)])]
+
+
 def menu_inv(win, g):
-    sel = 0
-    last_tap = None
+    tab, sel, last_tap, armed = 0, 0, None, None
     while True:
         win.erase()
         h, w = win.getmaxyx()
         half = w // 2
-        put(win, 0, 0, 'GEAR', cp(4, True))
-        for y, (slot, it) in enumerate(g.equip.items(), 1):
-            put(win, y, 0, f'[{slot[:3]}] ' + (it['name'] if it else '-'), cp(RCOL[it['rarity']]) if it else curses.A_DIM)
-        avail = max(3, h - 5 - 3)
-        n = len(g.pack)
+        ents = bag_entries(g, tab)
+        n = len(ents)
         sel = min(sel, max(0, n - 1))
-        top = scroll_top(sel, avail, n)
-        for i in range(top, min(n, top + avail)):
-            it = g.pack[i]
-            nm = ('Gem: ' + SKILLS[it['skill']]['name']) if it['slot'] == 'gem' else it['name']
-            put(win, 5 + i - top, 0, ('>' if i == sel else ' ') + nm[:half - 2], cp(RCOL[it['rarity']], i == sel))
-        if g.pack:
-            for j, (t, a) in enumerate(item_lines(g, g.pack[sel])):
-                put(win, 1 + j, half, t, a)
-        btns = menu_bar(win, [('↑', ord('k')), ('↓', ord('j')), ('Equip', 10), ('Drop', ord('x')), ('Back', 27)])
+        page, pages = sel // PAGE, max(1, (n + PAGE - 1) // PAGE)
+        btns = []
+        tw = w // len(TABS)
+        for i, (lab, kind) in enumerate(TABS):
+            cnt = sum(1 for it in g.pack if it['slot'] == kind) if kind in SLOTNAME else ''
+            button(win, btns, 0, i * tw, 3, tw, [f'{lab} {cnt}'.strip()], 1000 + i, cp(4, True) if i == tab else curses.A_DIM)
+        ch = max(1, min(3, (h - 7) // 4))
+        cw = half // 4
+        for sl in range(PAGE):
+            gi = page * PAGE + sl
+            y, x = 3 + (sl // 4) * ch, (sl % 4) * cw
+            e = ents[gi] if gi < n else None
+            a = (e['attr'] if e else curses.A_DIM) | (curses.A_REVERSE if gi == sel and e else 0)
+            label = (e['label'] if e else '·')[:cw - 2]
+            if ch >= 2:
+                box(win, y, x, ch, cw, [label], a)
+            else:
+                put(win, y, x, label.center(cw - 1), a)
+            btns.append((y, x, ch, cw, 2000 + sl))
+        put(win, h - 4, 0, f'Page {page + 1}/{pages}  {n} slots', curses.A_DIM)
+        if g.log:
+            put(win, h - 4, half, g.log[-1], 0)
+        e = ents[sel] if n else None
+        y = 3
+        if e:
+            lines = e['lines'] if 'lines' in e else item_lines(g, e['it'])
+            for t, at in lines[:h - 12]:
+                put(win, y, half + 1, t[:w - half - 2], at)
+                y += 1
+            if e['kind'] == 'gear':
+                it = e['it']
+                sc, es = g.salvage_value(it)
+                rc = g.reroll_cost(it)
+                y = max(y + 1, h - 11)
+                put(win, y, half + 1, f'Salvage +{sc} scrap' + (f' +{es} ess' if es else ''), curses.A_DIM)
+                if rc:
+                    put(win, y + 1, half + 1, f'Reroll {rc[0]} scrap' + (f' + {rc[1]} ess' if rc[1] else '') + ' (refits to depth)', curses.A_DIM)
+                if it['rarity'] == 'legend':
+                    k = 1 + g.depth / 10
+                    put(win, y + 2, half + 1, f'Ascend {int(400 * k)} scrap + 40 ess -> mythic', curses.A_DIM)
+                eq = g.equip[it['slot']]
+                put(win, y + 3, half + 1, 'Equipped: ' + (eq['name'] if eq else '-'), cp(RCOL[eq['rarity']]) if eq else curses.A_DIM)
+        bw = w // 7
+        defs = [('Pg◀', ord(',')), ('Pg▶', ord('.'))]
+        if e and e['kind'] == 'gear':
+            defs += [('Equip', 10), ('Salvage', ord('v')), ('Reroll', ord('r')), ('Ascend', ord('a'))]
+        elif e and e['kind'] == 'cons':
+            defs += [('Use', 10)]
+        defs.append(('Back', 27))
+        bw = w // len(defs)
+        for i, (lab, key) in enumerate(defs):
+            button(win, btns, h - 3, i * bw, 3, bw, [lab], key, curses.A_DIM)
         win.refresh()
         c = getin(win, btns)
-        if isinstance(c, tuple):
-            row = c[1] - 5 + top
-            if 5 <= c[1] < 5 + avail and 0 <= row < n and c[2] < half:
-                if row == last_tap and g.pack[row]['slot'] != 'gem':
-                    g.equip_item(row)
-                    last_tap = None
-                else:
-                    last_tap = row
-                sel = row
+        if c == -1 or isinstance(c, tuple):
             continue
+        if 1000 <= c < 1000 + len(TABS):
+            tab, sel, last_tap, armed = c - 1000, 0, None, None
+            continue
+        if 2000 <= c < 2000 + PAGE:
+            gi = page * PAGE + (c - 2000)
+            if gi < n:
+                if last_tap == gi:
+                    c = 10
+                else:
+                    last_tap, sel, armed = gi, gi, None
+                    continue
+            else:
+                continue
         if c in (27, ord('q'), ord('i')):
             return
-        if c in (curses.KEY_DOWN, ord('j')) and g.pack:
-            sel = (sel + 1) % n
-        elif c in (curses.KEY_UP, ord('k')) and g.pack:
-            sel = (sel - 1) % n
-        elif c in (10, 13) and g.pack:
-            if g.pack[sel]['slot'] != 'gem':
-                g.equip_item(sel)
-        elif c == ord('x') and g.pack:
-            g.pack.pop(sel)
+        if c in (curses.KEY_LEFT, ord('h')):
+            sel = max(0, sel - 1)
+        elif c in (curses.KEY_RIGHT, ord('l')):
+            sel = min(max(0, n - 1), sel + 1)
+        elif c in (curses.KEY_UP, ord('k')):
+            sel = max(0, sel - 4)
+        elif c in (curses.KEY_DOWN, ord('j')):
+            sel = min(max(0, n - 1), sel + 4)
+        elif c == ord(','):
+            sel = max(0, sel - PAGE)
+        elif c == ord('.'):
+            sel = min(max(0, n - 1), sel + PAGE)
+        elif e and c in (10, 13):
+            last_tap = None
+            if e['kind'] == 'gear':
+                g.equip_item(e['idx'])
+            elif e['kind'] == 'cons':
+                g.use_cons(e['key'])
+        elif e and e['kind'] == 'gear' and c in (ord('v'), ord('r'), ord('a')):
+            it = e['it']
+            if it['rarity'] in ('rare', 'legend', 'mythic', 'unique') and armed != (c, sel):
+                armed = (c, sel)
+                g.say(f'Press {chr(c).upper()} / the same button again to confirm on {it["name"]}')
+                continue
+            armed = None
+            if c == ord('v'):
+                g.salvage(e['idx'])
+            elif c == ord('r'):
+                g.reroll(e['idx'])
+            else:
+                g.ascend(e['idx'])
 
 
 def menu_skills(win, g):
@@ -1371,6 +1608,8 @@ def run(win):
             used = True
         elif c in (ord('>'), 10, 13):
             used = g.descend()
+        elif c in (ord('p'), ord('o')):
+            used = g.use_cons('hp' if c == ord('p') else 'mp')
         elif c == ord('i'):
             menu_inv(win, g)
         elif c == ord('K'):
