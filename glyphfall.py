@@ -70,6 +70,37 @@ def node_at(seed, x, y):
     return dict(kind='minor', name='Minor ' + s[0], stats={s[0]: max(1, int(s[1] * scale))})
 
 
+def node_at_skill(seed, key, x, y):
+    """Per-skill infinite grid. Stats are sk_* and only apply while that skill is being cast."""
+    if (x, y) == (0, 0):
+        return dict(kind='origin', name=SKILLS[key]['name'], stats={})
+    sk = SKILLS[key]
+    r = random.Random(zlib.crc32(f'{seed}:{key}:{x}:{y}'.encode()))
+    sc = 1 + (abs(x) + abs(y)) * 0.05
+    roll = r.random()
+    if roll < 0.05:
+        k = r.choice([('Overload', {'sk_dmg': 80, 'sk_cost': -4}), ('Efficiency', {'sk_cost': 4, 'sk_dmg': -15}),
+                      ('Echo Chamber', {'sk_echo': 35, 'sk_dmg': -15}), ('Bloodthirst', {'sk_leech': 18}),
+                      ('Executioner', {'sk_crit': 25, 'sk_dmg': -10})])
+        return dict(kind='key', name=k[0], stats=k[1])
+    if roll < 0.22:
+        opts = [('sk_dmg', int(22 * sc), 'Power'), ('sk_echo', int(12 * sc), 'Echo'), ('sk_burn', int(25 * sc), 'Searing'),
+                ('sk_slow', 2, 'Chill'), ('sk_leech', int(6 * sc), 'Thirst')]
+        if 'aoe' in sk['tags']:
+            opts.append(('sk_radius', 1, 'Reach'))
+        if 'rng' in sk or 'projectile' in sk['tags']:
+            opts.append(('sk_range', 2, 'Far Sight'))
+        if 'chain' in sk['tags']:
+            opts.append(('sk_chain', 1, 'Arc'))
+        o = r.choice(opts)
+        return dict(kind='notable', name=f'{o[2]} ({sk["name"]})', stats={o[0]: o[1]})
+    opts = [('sk_dmg', int(7 * sc)), ('sk_crit', int(3 * sc)), ('sk_leech', max(1, int(1.5 * sc))), ('sk_cost', 1)]
+    if sk['cd'] > 0:
+        opts.append(('sk_cd', 1))
+    o = r.choice(opts)
+    return dict(kind='minor', name='Minor ' + o[0][3:], stats={o[0]: o[1]})
+
+
 class Game:
     def __init__(self, seed=None):
         self.seed = seed or random.randrange(1 << 30)
@@ -82,6 +113,8 @@ class Game:
         self.known = list(START_SKILLS)
         self.slots = list(START_SKILLS)
         self.cd, self.buffs, self.log = {}, {}, []
+        self.mastery = {}
+        self.ms, self.cur = {}, None
         self.face = (1, 0)
         self.turn = 0
         self.dead = False
@@ -93,7 +126,8 @@ class Game:
     def save(self):
         d = dict(seed=self.seed, depth=self.depth, lvl=self.lvl, xp=self.xp, points=self.points, alloc=sorted(self.alloc),
                  equip=self.equip, pack=self.pack, known=self.known, slots=self.slots, hp=self.hp, mana=self.mana, turn=self.turn,
-                 best=getattr(self, 'best', self.depth), deaths=getattr(self, 'deaths', 0))
+                 best=getattr(self, 'best', self.depth), deaths=getattr(self, 'deaths', 0),
+                 mastery={k: dict(m, alloc=sorted(m['alloc'])) for k, m in self.mastery.items()})
         os.makedirs(os.path.dirname(SAVE), exist_ok=True)
         with open(SAVE + '.tmp', 'w') as f:
             json.dump(d, f)
@@ -111,6 +145,8 @@ class Game:
             if it:
                 tuple_aff(it)
         g.cd, g.buffs, g.log = {}, {}, []
+        g.mastery = {k: dict(m, alloc={tuple(p) for p in m['alloc']}) for k, m in d.get('mastery', {}).items()}
+        g.ms, g.cur = {}, None
         g.face, g.turn, g.dead = (1, 0), d['turn'], False
         g.depth = d['depth'] - 1
         g.best, g.deaths = d.get('best', d['depth']), d.get('deaths', 0)
@@ -128,6 +164,29 @@ class Game:
         self.new_level()
         self.hp, self.mana = self.st('hp'), self.st('mana')
         self.say('You wake at the entrance. Depth lost, gear kept.')
+
+    # ---- skill mastery: casting a skill trains it; its own grid improves only that skill
+    def mas(self, key):
+        return self.mastery.setdefault(key, dict(xp=0, lvl=0, points=0, alloc={(0, 0)}))
+
+    def mstats(self, key):
+        out = {}
+        for p in self.mas(key)['alloc']:
+            for k, v in node_at_skill(self.seed, key, *p)['stats'].items():
+                out[k] = out.get(k, 0) + v
+        return out
+
+    def train(self, key, n):
+        m = self.mas(key)
+        m['xp'] += n
+        while m['xp'] >= int(6 * (m['lvl'] + 1) ** 1.5):
+            m['xp'] -= int(6 * (m['lvl'] + 1) ** 1.5)
+            m['lvl'] += 1
+            m['points'] += 1
+            self.say(f'{SKILLS[key]["name"]} mastery {m["lvl"]}! +1 point (Skl > Master)')
+
+    def eff_cost(self, key):
+        return max(0, SKILLS[key]['cost'] - self.mstats(key).get('sk_cost', 0))
 
     # ---- stats
     def stats(self):
@@ -252,7 +311,10 @@ class Game:
         for a in AFFIXES:
             if a[0] == stat:
                 return a[1].format(v)
-        return {'more_dmg': '+{}% More Damage', 'hp_mult': '{:+}% Max Life'}.get(stat, stat + ' {}').format(v)
+        return {'more_dmg': '+{}% More Damage', 'hp_mult': '{:+}% Max Life', 'sk_dmg': '{:+}% skill damage', 'sk_cost': '{:+} mana discount',
+                'sk_cd': '-{} cooldown', 'sk_crit': '+{}% skill crit', 'sk_leech': '+{}% skill leech', 'sk_echo': '{}% chance to cast twice',
+                'sk_burn': 'hits burn for {}% over 3 turns', 'sk_slow': 'hits slow for {} turns', 'sk_range': '+{} range',
+                'sk_radius': '+{} radius', 'sk_chain': '+{} chain/targets'}.get(stat, stat + ' {}').format(v)
 
     def pickup(self):
         for it in self.items.pop((self.px, self.py), []):
@@ -304,11 +366,11 @@ class Game:
     def calc(self, base, tags, melee_weapon=False):
         s = self.stats()
         d = base + (s['weapon'] * 0.6 if melee_weapon else 0)
-        pct = s.get('dmg_pct', 0) + sum(s.get(t + '_pct', 0) for t in tags)
+        pct = s.get('dmg_pct', 0) + sum(s.get(t + '_pct', 0) for t in tags) + self.ms.get('sk_dmg', 0)
         if 'pact' in self.buffs:
             pct += 50
         d *= max(0.1, 1 + pct / 100) * (1 + s.get('more_dmg', 0) / 100)
-        crit = self.rng.random() * 100 < 5 + s.get('crit', 0)
+        crit = self.rng.random() * 100 < 5 + s.get('crit', 0) + self.ms.get('sk_crit', 0)
         if crit:
             d *= 2
         return max(1, int(d)), crit
@@ -318,10 +380,15 @@ class Game:
             return 0
         e['hp'] -= dmg
         e['awake'] = True
-        lc = self.st('leech')
+        lc = self.st('leech') + self.ms.get('sk_leech', 0)
         if lc:
             self.hp = min(self.st('hp'), self.hp + max(0, int(dmg * lc / 100)))
         self.say(f'{src}{e["name"]} -{dmg}{"!" if crit else ""}' + (' (dies)' if e['hp'] <= 0 else ''))
+        if e['hp'] > 0 and self.ms:
+            if self.ms.get('sk_burn'):
+                e['dots'].append((max(1, int(dmg * self.ms['sk_burn'] / 100)), 3))
+            if self.ms.get('sk_slow'):
+                e['slow'] = max(e['slow'], self.ms['sk_slow'])
         if e['hp'] <= 0:
             self.kill(e)
         return dmg
@@ -329,6 +396,8 @@ class Game:
     def kill(self, e):
         if e in self.en:
             self.en.remove(e)
+        if self.cur:
+            self.train(self.cur, 2)
         self.gain_xp(e['xp'])
         if e['champ'] or self.rng.random() < 0.28:
             for _ in range(3 if e['boss'] else 1):
@@ -344,6 +413,7 @@ class Game:
             self.say(f'LEVEL {self.lvl}! +1 passive point (T)')
 
     def nearest(self, rng):
+        rng += self.ms.get('sk_range', 0)
         c = [e for e in self.en if (e['x'], e['y']) in self.vis and (e['x'] - self.px) ** 2 + (e['y'] - self.py) ** 2 <= rng * rng]
         return min(c, key=lambda e: (e['x'] - self.px) ** 2 + (e['y'] - self.py) ** 2) if c else None
 
@@ -358,17 +428,28 @@ class Game:
         if self.cd.get(key, 0) > 0:
             self.say(f'{sk["name"]} cooling ({self.cd[key]})')
             return False
-        if self.mana < sk['cost']:
+        ms = self.mstats(key)
+        cost = self.eff_cost(key)
+        if self.mana < cost:
             self.say('Not enough mana')
             return False
-        ok = getattr(self, 'sk_' + key)(sk)
-        if ok:
-            self.mana -= sk['cost']
-            self.cd[key] = sk['cd']
+        self.ms, self.cur = ms, key
+        try:
+            ok = getattr(self, 'sk_' + key)(sk)
+            if ok:
+                self.mana -= cost
+                self.cd[key] = max(0, sk['cd'] - ms.get('sk_cd', 0))
+                self.train(key, 1)
+                if self.rng.random() * 100 < ms.get('sk_echo', 0):
+                    self.say('Echo!')
+                    getattr(self, 'sk_' + key)(sk)
+        finally:
+            self.ms, self.cur = {}, None
         return ok
 
     def sk_whirlwind(self, sk):
-        adj = self.adjacent()
+        rr = 1 + self.ms.get('sk_radius', 0)
+        adj = [e for e in self.en if max(abs(e['x'] - self.px), abs(e['y'] - self.py)) <= rr]
         if not adj:
             self.say('Nothing adjacent')
             return False
@@ -389,7 +470,7 @@ class Game:
         return True
 
     def sk_frost_nova(self, sk):
-        hit = [e for e in self.en if (e['x'] - self.px) ** 2 + (e['y'] - self.py) ** 2 <= 5]
+        hit = [e for e in self.en if (e['x'] - self.px) ** 2 + (e['y'] - self.py) ** 2 <= (2 + self.ms.get('sk_radius', 0)) ** 2 + 1]
         if not hit:
             self.say('Nothing in range')
             return False
@@ -422,7 +503,7 @@ class Game:
             self.say('No target')
             return False
         done, mult = [], 1.0
-        for _ in range(4):
+        for _ in range(4 + self.ms.get('sk_chain', 0)):
             if not e:
                 break
             d, c = self.calc(sk['base'], sk['tags'])
@@ -457,7 +538,7 @@ class Game:
         if not t:
             self.say('No target')
             return False
-        for e in [e for e in self.en if (e['x'] - t['x']) ** 2 + (e['y'] - t['y']) ** 2 <= 5]:
+        for e in [e for e in self.en if (e['x'] - t['x']) ** 2 + (e['y'] - t['y']) ** 2 <= (2 + self.ms.get('sk_radius', 0)) ** 2 + 1]:
             d, _ = self.calc(sk['base'], sk['tags'])
             e['dots'].append((d, 5))
             e['awake'] = True
@@ -569,12 +650,13 @@ class Game:
                     break
 
     # ---- passive tree
-    def frontier(self):
+    def frontier(self, alloc=None):
         out = set()
-        for x, y in self.alloc:
+        alloc = self.alloc if alloc is None else alloc
+        for x, y in alloc:
             for d in ((1, 0), (-1, 0), (0, 1), (0, -1)):
                 p = (x + d[0], y + d[1])
-                if p not in self.alloc:
+                if p not in alloc:
                     out.add(p)
         return out
 
@@ -583,6 +665,14 @@ class Game:
             self.alloc.add(p)
             self.points -= 1
             self.hp = min(self.hp, self.st('hp'))
+            return True
+        return False
+
+    def take_skill(self, key, p):
+        m = self.mas(key)
+        if m['points'] > 0 and p in self.frontier(m['alloc']):
+            m['alloc'].add(p)
+            m['points'] -= 1
             return True
         return False
 
@@ -719,8 +809,9 @@ def draw(win, g, btns, touch):
         for i, k in enumerate(g.slots):
             sk = SKILLS[k]
             cd = g.cd.get(k, 0)
-            ready = not cd and g.mana >= sk['cost']
-            second = f'{sk["cost"]}mp' + (f' cd{cd}' if cd else '')
+            ec = g.eff_cost(k)
+            ready = not cd and g.mana >= ec
+            second = f'{ec}mp' + (f' cd{cd}' if cd else '') + (' ✚' if g.mas(k)['points'] else '')
             button(win, btns, y1 + 4 * (i // 2), w - PANEL + 10 * (i % 2), 4, 10,
                    [f'{i + 1} {sk["name"][:7]}', second], ord('1') + i, cp(7, True) if ready else curses.A_DIM)
         for i, (lab, key) in enumerate(ACTIONS):
@@ -731,7 +822,7 @@ def draw(win, g, btns, touch):
         for i, k in enumerate(g.slots):
             sk = SKILLS[k]
             c = g.cd.get(k, 0)
-            sb += f'{i + 1}:{sk["name"][:9]}{"(" + str(c) + ")" if c else "":<3}{sk["cost"]} '
+            sb += f'{i + 1}:{sk["name"][:9]}{"(" + str(c) + ")" if c else "":<3}{g.eff_cost(k)} '
         put(win, h - 2, 0, sb, cp(7))
         put(win, h - 1, 0, 'hjklyubn/arrows move 1-4 skill i gear K skills t tree > stairs', curses.A_DIM)
     win.refresh()
@@ -811,7 +902,8 @@ def menu_skills(win, g):
         for i in range(top, min(n, top + avail)):
             k = g.known[i]
             sk = SKILLS[k]
-            put(win, 1 + i - top, 0, ('>' if i == sel else ' ') + f'{sk["name"]} ({sk["cost"]}mp)' + (' *' if k in g.slots else ''),
+            m = g.mas(k)
+            put(win, 1 + i - top, 0, ('>' if i == sel else ' ') + f'{sk["name"]} ({g.eff_cost(k)}mp) m{m["lvl"]}' + (f' ✚{m["points"]}' if m['points'] else '') + (' *' if k in g.slots else ''),
                 cp(7 if k in g.slots else 1, i == sel))
         for i, k in enumerate(g.slots):
             put(win, 1 + i, half, f'{i + 1}: {SKILLS[k]["name"]}', cp(7, True))
@@ -819,7 +911,7 @@ def menu_skills(win, g):
         put(win, 6, half, sk['name'], cp(4, True))
         put(win, 7, half, sk['desc'][:w - half - 1])
         put(win, 8, half, 'tags: ' + ' '.join(sorted(sk['tags'])), curses.A_DIM)
-        btns = menu_bar(win, [('↑', ord('k')), ('↓', ord('j')), ('→1', ord('1')), ('→2', ord('2')), ('→3', ord('3')), ('→4', ord('4')), ('Back', 27)])
+        btns = menu_bar(win, [('↑', ord('k')), ('↓', ord('j')), ('→1', ord('1')), ('→2', ord('2')), ('→3', ord('3')), ('→4', ord('4')), ('Master', ord('m')), ('Back', 27)])
         win.refresh()
         c = getin(win, btns)
         if isinstance(c, tuple):
@@ -829,7 +921,9 @@ def menu_skills(win, g):
             continue
         if c in (27, ord('q')):
             return
-        if c in (curses.KEY_DOWN, ord('j')):
+        if c == ord('m'):
+            menu_tree(win, g, g.known[sel])
+        elif c in (curses.KEY_DOWN, ord('j')):
             sel = (sel + 1) % n
         elif c in (curses.KEY_UP, ord('k')):
             sel = (sel - 1) % n
@@ -843,13 +937,20 @@ def menu_skills(win, g):
                 g.slots[i] = k
 
 
-def menu_tree(win, g):
+def menu_tree(win, g, key=None):
     cx, cy = 0, 0
     while True:
         win.erase()
         h, w = win.getmaxyx()
-        put(win, 0, 0, f'TREE  points:{g.points}  tap a node to focus, tap it again to take', cp(4, True))
-        fr = g.frontier()
+        if key:
+            m = g.mas(key)
+            alloc, pts, nodefn = m['alloc'], m['points'], lambda x, y: node_at_skill(g.seed, key, x, y)
+            take = lambda p: g.take_skill(key, p)
+            title = f'{SKILLS[key]["name"].upper()} MASTERY lv{m["lvl"]} ({m["xp"]}/{int(6 * (m["lvl"] + 1) ** 1.5)})'
+        else:
+            alloc, pts, nodefn, take, title = g.alloc, g.points, lambda x, y: node_at(g.seed, x, y), g.take, 'TREE'
+        put(win, 0, 0, f'{title}  points:{pts}  tap a node to focus, tap it again to take', cp(4, True))
+        fr = g.frontier(alloc)
         for sy in range(1, h - 7):
             if (sy - h // 2 + 2) % 2:
                 continue
@@ -858,10 +959,10 @@ def menu_tree(win, g):
                 if (sx - w // 2) % 4:
                     continue
                 x = cx + (sx - w // 2) // 4
-                if (x, y) in g.alloc:
+                if (x, y) in alloc:
                     ch, a = '◉', cp(3, True)
                 elif (x, y) in fr:
-                    n = node_at(g.seed, x, y)
+                    n = nodefn(x, y)
                     ch = {'minor': '○', 'notable': '◈', 'key': '★'}[n['kind']]
                     a = cp(7 if n['kind'] == 'minor' else 4 if n['kind'] == 'notable' else 6, True)
                 else:
@@ -869,8 +970,8 @@ def menu_tree(win, g):
                 if (x, y) == (cx, cy):
                     a |= curses.A_REVERSE
                 put(win, sy, sx, ch, a)
-        n = node_at(g.seed, cx, cy)
-        state = 'taken' if (cx, cy) in g.alloc else 'available' if (cx, cy) in fr else 'unreachable'
+        n = nodefn(cx, cy)
+        state = 'taken' if (cx, cy) in alloc else 'available' if (cx, cy) in fr else 'unreachable'
         put(win, h - 6, 0, f'{n["name"]} [{n["kind"]}] {state}', cp(4, True))
         put(win, h - 5, 0, ', '.join(g.aff_text(k, v) for k, v in n['stats'].items()))
         btns = menu_bar(win, [('←', ord('h')), ('↑', ord('k')), ('↓', ord('j')), ('→', ord('l')), ('Take', 10), ('Back', 27)])
@@ -881,7 +982,7 @@ def menu_tree(win, g):
             if 1 <= ty < h - 7:
                 dx, dy = round((tx - w // 2) / 4), round((ty - h // 2 + 2) / 2)
                 if (dx, dy) == (0, 0):
-                    if not g.take((cx, cy)):
+                    if not take((cx, cy)):
                         g.say('Cannot take that')
                 cx, cy = cx + dx, cy + dy
             continue
@@ -891,7 +992,7 @@ def menu_tree(win, g):
             cx += KEYS[c][0]
             cy += KEYS[c][1]
         elif c in (10, 13):
-            if not g.take((cx, cy)):
+            if not take((cx, cy)):
                 g.say('Cannot take that')
 
 
