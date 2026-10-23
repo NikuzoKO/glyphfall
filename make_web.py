@@ -83,7 +83,7 @@ def main():
 """)
     gui = sub(gui, "self.screen = pygame.display.set_mode((w, h))", "self.screen = pygame.display.set_mode((w, h), pygame.SCALED)")
     gui = sub(gui, "win = os.environ.get('GF_WINDOW')", "win = os.environ.get('GF_WINDOW') or '1170x540'")
-    gui = sub(gui, "            self.clock.tick(60)\n", "            self.clock.tick(60)\n            await asyncio.sleep(0)\n")
+    gui = sub(gui, "            self.clock.tick(30 if self.busy() else 8 if pygame.display.get_active() else 2)\n", "            self.clock.tick(30 if self.busy() else 8)\n            await asyncio.sleep(0)\n")
     gui = sub(gui, "    await App().run()", "    asyncio.run(App().run())")
 
     os.makedirs(OUT, exist_ok=True)

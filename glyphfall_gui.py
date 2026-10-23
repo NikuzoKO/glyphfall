@@ -197,6 +197,7 @@ class App:
         self.next_act, self.fl = 0.0, []
         self.next_tick = time.time() + TICK
         self.flash, self.shake, self.hurt_a = {}, 0.0, 0.0
+        self.btn_cache = {}
         self.quit_armed = 0.0
         self.pp = None
         self.cam = None
@@ -571,6 +572,15 @@ class App:
             self.cam[0] += (tx - self.cam[0]) * kc
             self.cam[1] += (ty - self.cam[1]) * kc
 
+    def busy(self):
+        """Anything moving or being touched? Otherwise only the idle bob needs frames, so render at half rate."""
+        if self.held or self.queue or self.fl or self.flash or self.shake or self.hurt_a or self.pp is None:
+            return True
+        g = self.g
+        if abs(g.px - self.pp[0]) > 0.01 or abs(g.py - self.pp[1]) > 0.01:
+            return True
+        return any(abs(e['x'] - e.get('rx', e['x'])) > 0.01 or abs(e['y'] - e.get('ry', e['y'])) > 0.01 for e in g.en)
+
     def draw(self):
         g, T, scr = self.g, self.T, self.screen
         scr.fill(BG)
@@ -728,9 +738,12 @@ class App:
                     border, color = PAL[4], PAL[4]
                 if b['key'] == ord('Q') and time.time() - self.quit_armed < 2.5:
                     border, color = PAL[2], PAL[2]
-            surf = pygame.Surface(r.size, pygame.SRCALPHA)
-            pygame.draw.rect(surf, fill + ((230 if pressed else 150),), surf.get_rect(), border_radius=10)
-            pygame.draw.rect(surf, border + (255,), surf.get_rect(), 3 if pressed else 2, border_radius=10)
+            sk_ = (r.size, fill, border, pressed)
+            surf = self.btn_cache.get(sk_)
+            if surf is None:
+                surf = self.btn_cache[sk_] = pygame.Surface(r.size, pygame.SRCALPHA)
+                pygame.draw.rect(surf, fill + ((230 if pressed else 150),), surf.get_rect(), border_radius=10)
+                pygame.draw.rect(surf, border + (255,), surf.get_rect(), 3 if pressed else 2, border_radius=10)
             scr.blit(surf, r.topleft)
             if kind == 'skill':
                 key = g.slots[b['slot']]
@@ -805,7 +818,7 @@ class App:
             self.update(dt)
             self.draw()
             self.present()
-            self.clock.tick(60)
+            self.clock.tick(30 if self.busy() else 8 if pygame.display.get_active() else 2)
 
 
 if __name__ == '__main__':
