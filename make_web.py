@@ -6,6 +6,7 @@ The browser cannot block, so every function that waits for a key is turned into 
 The desktop sources are not touched.
 """
 import ast
+import glob
 import os
 import shutil
 import sys
@@ -92,7 +93,11 @@ def main():
         compile(s, f, 'exec')
     shutil.copy(os.path.join(HERE, 'web_curses.py'), os.path.join(OUT, 'curses.py'))
     for font in ('DejaVuSansMono.ttf', 'DejaVuSans.ttf'):
-        shutil.copy('/usr/share/fonts/dejavu/' + font, OUT)
+        src = next(iter(glob.glob(f'/usr/share/fonts/**/{font}', recursive=True)), None)
+        if src:
+            shutil.copy(src, OUT)
+        elif not os.path.exists(os.path.join(OUT, font)):
+            sys.exit(f'{font} not found')
     print('async:', ', '.join(sorted(names)))
 
 
