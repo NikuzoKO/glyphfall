@@ -25,6 +25,7 @@ import glyphfall as G
 BG = (22, 21, 36)
 PAL = {0: (225, 220, 240), 1: (225, 220, 240), 2: (240, 105, 125), 3: (115, 215, 145), 4: (245, 200, 105),
        5: (120, 160, 255), 6: (210, 140, 255), 7: (105, 215, 225)}
+SPECIAL_GL = {'>': '▼', '<': '▲', 'D': '∩', 'F': '♨'}
 LINES = set('─│┌┐└┘')
 SHADES = {'█': 1.0, '▓': 0.75, '▒': 0.5, '░': 0.25}
 RARITY_RGB = {'normal': PAL[1], 'magic': PAL[7], 'rare': PAL[4], 'legend': PAL[6], 'mythic': PAL[2], 'unique': PAL[3]}
@@ -269,8 +270,9 @@ class App:
         for i in range(4):
             self.btns.append(dict(kind='skill', slot=i, rect=pygame.Rect(right - 2 * sw - gap + (i % 2) * (sw + gap), ytop + (i // 2) * (sh + gap), sw, sh),
                                   key=ord('1') + i, rep=0.32))
-        aw = (2 * sw + gap - 4 * gap) // 5
-        for i, (lab, key) in enumerate(G.ACTIONS + [('Quit', ord('Q'))]):
+        acts = G.ACTIONS + [('Map', ord('M')), ('Quit', ord('Q'))]
+        aw = (2 * sw + gap - (len(acts) - 1) * gap) // len(acts)
+        for i, (lab, key) in enumerate(acts):
             self.btns.append(dict(kind='act', rect=pygame.Rect(right - 2 * sw - gap + i * (aw + gap), UH - m - ah, aw, ah), label=lab, key=key, rep=0))
         self.stick_r = int(UH * 0.17)
         self.stick_home = (m + int(B * 2.1), UH - m - int(B * 1.7))
@@ -391,6 +393,8 @@ class App:
             self.menu(G.menu_skills)
         elif c == ord('t'):
             self.menu(G.menu_tree)
+        elif c == ord('M'):
+            self.menu(G.menu_world)
         elif c == ord('Q'):
             now = time.time()
             if now - self.quit_armed < 2.5:
@@ -492,6 +496,10 @@ class App:
             for lvl, k in enumerate((1.0, 0.82, 0.64, 0.48)):
                 out[('o' + kind, lvl)] = outdoor(kind, k)
             out['o' + kind + '_dim'] = outdoor(kind, 0.4)
+        for kind, base in (('W', 'wall'), ('d', 'floor')):   # dungeon stone
+            for lvl in range(4):
+                out[('o' + kind, lvl)] = out[(base, lvl)]
+            out['o' + kind + '_dim'] = out[base + '_dim']
         for lvl, k in enumerate((1.0, 0.82, 0.64, 0.48)):
             for nm in ('stairs',):
                 st_ = outdoor('g', k)
@@ -599,10 +607,16 @@ class App:
                 t = row[tx]
                 if (tx, ty) in vis:
                     lvl = min(3, int(math.hypot(tx - px, ty - py) / 9 * 3.2))
-                    s = tl[('stairs', lvl) if t == '>' else ('o' + g.ter[ty][tx], lvl)]
+                    s = tl[('o' + g.ter[ty][tx], lvl)]
                 else:
-                    s = tl['stairs_dim' if t == '>' else 'o' + g.ter[ty][tx] + '_dim']
+                    s = tl['o' + g.ter[ty][tx] + '_dim']
                 scr.blit(s, (tx * T - cx, ty * T - cy))
+                if t in SPECIAL_GL or t == 'E':
+                    gl_ = SPECIAL_GL.get(t) or ('↑' if ty == 0 else '↓' if ty == G.H - 1 else '←' if tx == 0 else '→')
+                    col_ = PAL[2] if t == 'F' else PAL[7] if t == 'E' else PAL[4]
+                    if (tx, ty) not in vis:
+                        col_ = tuple(int(v * 0.5) for v in col_)
+                    self.put_glyph(gl_, col_, tx * T - cx, ty * T - cy, 0.8)
         now = time.time()
         pulse = 0.5 + 0.5 * math.sin(now * 9)
         for e in g.en:
@@ -615,6 +629,9 @@ class App:
         for (x, y) in g.chests:
             if seen[y][x]:
                 self.put_glyph('▣', PAL[4], x * T - cx, y * T - cy, 0.9)
+        for (x, y) in g.npcs:
+            if (x, y) in vis:
+                self.put_glyph('&', PAL[3], x * T - cx, y * T - cy + math.sin(now * 2 + x) * 1.5, 1.0, bold=True)
         for (x, y), its in g.items.items():
             if (x, y) in vis:
                 it = its[-1]
@@ -676,7 +693,7 @@ class App:
         scr.blit(gl.text(f'✦ {g.mana}/{s["mana"]}', PAL[1], u), (14 + bw + 14, 8 + u))
         need = int(18 * g.lvl ** 1.5)
         right = self.W - 12
-        t = gl.text(f'Lv {g.lvl}   ▼ Depth {g.depth}' + (f'   ✚{g.points}' if g.points else ''), PAL[4], int(u * 1.15))
+        t = gl.text(f'Lv {g.lvl}   {g.where()}' + (f'   ✚{g.points}' if g.points else ''), PAL[4], int(u * 1.15))
         scr.blit(t, (right - t.get_width(), 6))
         self.bar(right - 220, 8 + int(u * 1.5), 220, 6, g.xp / need, PAL[4])
         left = max(0, int(self.end - time.time()) // 60)
@@ -734,7 +751,7 @@ class App:
                 color = PAL[1] if ready else (130, 128, 150)
             else:
                 lines = [b['label']]
-                if b['key'] == ord('>') and g.g[g.py][g.px] == '>':
+                if b['key'] == ord('>') and g.g[g.py][g.px] in '><DF':
                     border, color = PAL[4], PAL[4]
                 if b['key'] == ord('Q') and time.time() - self.quit_armed < 2.5:
                     border, color = PAL[2], PAL[2]

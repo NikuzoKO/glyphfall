@@ -186,64 +186,268 @@ def tuple_aff(it):
     return it
 
 
-def node_at(seed, x, y):
-    """Infinite passive grid: every (x,y) is a deterministic node."""
-    if (x, y) == (0, 0):
-        return dict(kind='origin', name='Origin', stats={})
-    r = random.Random(zlib.crc32(f'{seed}:{x}:{y}'.encode()))
-    roll = r.random()
-    scale = 1 + (abs(x) + abs(y)) * 0.04
-    if roll < 0.04:
-        k = r.choice([('Glass Cannon', {'more_dmg': 60, 'hp_mult': -40}), ('Arcane Surge', {'mana': 40, 'mregen': 3, 'dmg_pct': -10}),
-                      ('Iron Will', {'armor': 30, 'hp': 20, 'crit': -5}), ('Vampiric Pact', {'leech': 8, 'hp_mult': -20}),
-                      ('Elemental Rage', {'fire_pct': 40, 'cold_pct': 40, 'lightning_pct': 40, 'phys_pct': -30})])
-        return dict(kind='key', name=k[0], stats=k[1])
-    if roll < 0.20:
-        if r.random() < 0.7:
-            t = r.choice(TAGS)
-            return dict(kind='notable', name=r.choice(['Mastery', 'Focus', 'Fury', 'Pull', 'Edge']) + ' of ' + t.title(), stats={t + '_pct': int(18 * scale)})
-        s = r.choice([('leech', 3, 'Hunger'), ('find', 15, 'Fortune'), ('crit', 6, 'Precision'), ('hp', 25, 'Vigor')])
-        return dict(kind='notable', name=s[2], stats={s[0]: int(s[1] * scale)})
-    s = r.choice([('hp', 6), ('mana', 4), ('weapon', 1), ('dmg_pct', 3), ('crit', 2), ('armor', 3), ('regen', 1)])
-    return dict(kind='minor', name='Minor ' + s[0], stats={s[0]: max(1, int(s[1] * scale))})
+# ---- passive tree: 11 class paths around the origin. Gates of opposite classes close each other, every class forks
+# into 3 mutually exclusive arms, and bridge nodes join neighbouring classes. Nothing is random: the shape is the build.
+class Tree:
+    def __init__(self):
+        self.n, self.edges = {}, set()
+
+    def add(self, pos, name, kind, stats, cls=None):
+        pos = (int(round(pos[0])), int(round(pos[1])))
+        while pos in self.n:
+            pos = (pos[0] + 1, pos[1])
+        self.n[pos] = dict(id=pos, name=name, kind=kind, stats=stats, adj=set(), excl=set(), cls=cls)
+        return pos
+
+    def link(self, a, b):
+        self.n[a]['adj'].add(b)
+        self.n[b]['adj'].add(a)
+        self.edges.add((min(a, b), max(a, b)))
+
+    def exclude(self, *ids):
+        for a in ids:
+            self.n[a]['excl'] |= set(ids) - {a}
 
 
-def node_at_skill(seed, key, x, y):
-    """Per-skill infinite grid. Stats are sk_* and only apply while that skill is being cast."""
-    if (x, y) == (0, 0):
-        return dict(kind='origin', name=SKILLS[key]['name'], stats={})
-    sk = SKILLS[key]
-    r = random.Random(zlib.crc32(f'{seed}:{key}:{x}:{y}'.encode()))
-    sc = 1 + (abs(x) + abs(y)) * 0.05
-    roll = r.random()
-    sp = SPECIALS.get(key)
-    if roll < 0.05:
-        if sp and r.random() < 0.6:
-            k = r.choice(sp['key'])
-            return dict(kind='key', name=k[0], stats=k[1])
-        k = r.choice([('Overload', {'sk_dmg': 80, 'sk_cost': -4}), ('Efficiency', {'sk_cost': 4, 'sk_dmg': -15}),
-                      ('Echo Chamber', {'sk_echo': 35, 'sk_dmg': -15}), ('Bloodthirst', {'sk_leech': 18}),
-                      ('Executioner', {'sk_crit': 25, 'sk_dmg': -10})])
-        return dict(kind='key', name=k[0], stats=k[1])
-    if roll < 0.22:
-        if sp and r.random() < 0.45:
-            k = r.choice(sp['notable'])
-            return dict(kind='notable', name=k[0], stats=k[1])
-        opts = [('sk_dmg', int(22 * sc), 'Power'), ('sk_echo', int(12 * sc), 'Echo'), ('sk_burn', int(25 * sc), 'Searing'),
-                ('sk_slow', 2, 'Chill'), ('sk_leech', int(6 * sc), 'Thirst')]
-        if 'aoe' in sk['tags']:
-            opts.append(('sk_radius', 1, 'Reach'))
-        if 'rng' in sk or 'projectile' in sk['tags']:
-            opts.append(('sk_range', 2, 'Far Sight'))
-        if 'chain' in sk['tags']:
-            opts.append(('sk_chain', 1, 'Arc'))
-        o = r.choice(opts)
-        return dict(kind='notable', name=f'{o[2]} ({sk["name"]})', stats={o[0]: o[1]})
-    opts = [('sk_dmg', int(7 * sc)), ('sk_crit', int(3 * sc)), ('sk_leech', max(1, int(1.5 * sc))), ('sk_cost', 1)]
-    if sk['cd'] > 0:
-        opts.append(('sk_cd', 1))
-    o = r.choice(opts)
-    return dict(kind='minor', name='Minor ' + o[0][3:], stats={o[0]: o[1]})
+def tsum(*ds):
+    out = {}
+    for d in ds:
+        for k, v in d.items():
+            out[k] = out.get(k, 0) + v
+    return out
+
+
+def half(d):
+    return {k: (v // 2 if v > 0 else -((-v) // 2)) or (1 if v > 0 else -1) for k, v in d.items()}
+
+
+# name, signature stat, gate, trunk minor, trunk notable, 3 arms: (arm, minor, notable, key name, key stats)
+CLASSES = [
+    ('Warrior', {'armor': 6}, {'armor': 8, 'hp': 10}, {'armor': 5}, {'hp': 25, 'armor': 8}, [
+        ('Bulwark', {'armor': 8}, {'armor': 16, 'hp': 18}, 'Unbroken', {'armor': 50, 'hp_mult': 15, 'dmg_pct': -15}),
+        ('Duelist', {'weapon': 1, 'crit': 2}, {'weapon': 2, 'crit': 5}, 'Blademaster', {'phys_pct': 45, 'melee_pct': 25, 'armor': -20}),
+        ('Vanguard', {'melee_pct': 9}, {'melee_pct': 18, 'leech': 2}, 'Warlord', {'more_dmg': 25, 'hp': 30})]),
+    ('Barbarian', {'hp': 10}, {'hp': 14, 'leech': 1}, {'phys_pct': 8}, {'melee_pct': 16, 'hp': 20}, [
+        ('Berserker', {'dmg_pct': 4}, {'dmg_pct': 8, 'crit': 4}, 'Bloodrage', {'more_dmg': 55, 'hp_mult': -35}),
+        ('Reaver', {'leech': 1}, {'leech': 3, 'phys_pct': 12}, 'Gorehound', {'leech': 8, 'hp_mult': -15}),
+        ('Brute', {'hp': 12}, {'hp': 26, 'weapon': 1}, 'Titan', {'hp_mult': 30, 'weapon': 2, 'crit': -5})]),
+    ('Paladin', {'regen': 1}, {'armor': 6, 'regen': 1}, {'hp': 10}, {'armor': 10, 'regen': 1}, [
+        ('Aegis', {'armor': 7}, {'armor': 14, 'regen': 1}, 'Sanctuary', {'regen': 4, 'armor': 25, 'dmg_pct': -20}),
+        ('Crusader', {'melee_pct': 8}, {'melee_pct': 14, 'aoe_pct': 12}, 'Divine Wrath', {'aoe_pct': 40, 'phys_pct': 25, 'mana': -20}),
+        ('Templar', {'hp': 12}, {'hp': 22, 'leech': 2}, 'Martyr', {'hp': 60, 'leech': 4, 'armor': -15})]),
+    ('Cleric', {'mregen': 1}, {'mana': 10, 'regen': 1}, {'mana': 8}, {'hp': 18, 'mregen': 1}, [
+        ('Healer', {'regen': 1}, {'regen': 2, 'hp': 16}, 'Lifebloom', {'regen': 5, 'mregen': 2, 'dmg_pct': -20}),
+        ('Priest', {'mana': 10}, {'mana': 20, 'mregen': 2}, 'Wellspring', {'mana': 60, 'mregen': 4, 'hp_mult': -15}),
+        ('Smiter', {'dmg_pct': 4}, {'dmg_pct': 8, 'crit': 4}, 'Judgement', {'crit': 22, 'dmg_pct': 18, 'regen': -1})]),
+    ('Druid', {'poison_pct': 8}, {'hp': 10, 'regen': 1}, {'poison_pct': 8}, {'regen': 1, 'find': 8}, [
+        ('Grove', {'poison_pct': 9}, {'poison_pct': 18, 'regen': 1}, 'Blight Mother', {'poison_pct': 60, 'aoe_pct': 20, 'armor': -15}),
+        ('Tempest', {'lightning_pct': 9}, {'lightning_pct': 18, 'chain_pct': 10}, 'Stormcaller', {'lightning_pct': 50, 'chain_pct': 30, 'hp_mult': -15}),
+        ('Rimewood', {'cold_pct': 9}, {'cold_pct': 18, 'hp': 16}, 'Winter Spirit', {'cold_pct': 50, 'armor': 30, 'mana': -20})]),
+    ('Scout', {'crit': 3}, {'crit': 3, 'find': 6}, {'projectile_pct': 8}, {'crit': 5, 'find': 10}, [
+        ('Archer', {'projectile_pct': 9}, {'projectile_pct': 18, 'crit': 4}, 'Deadeye', {'crit': 28, 'projectile_pct': 30, 'hp_mult': -15}),
+        ('Trapper', {'poison_pct': 8}, {'poison_pct': 14, 'find': 10}, 'Venom Lord', {'poison_pct': 50, 'dmg_pct': 10, 'armor': -10}),
+        ('Pathfinder', {'find': 8}, {'find': 16, 'movement_pct': 12}, 'Treasure Sense', {'find': 60, 'dmg_pct': -10})]),
+    ('Necromancer', {'necro_pct': 8}, {'necro_pct': 8, 'mana': 8}, {'necro_pct': 8}, {'leech': 2, 'mana': 12}, [
+        ('Bonecaller', {'necro_pct': 9}, {'necro_pct': 18, 'projectile_pct': 8}, 'Ossuary', {'necro_pct': 60, 'projectile_pct': 25, 'armor': -15}),
+        ('Plaguebearer', {'poison_pct': 9}, {'poison_pct': 16, 'necro_pct': 10}, 'Pestilence', {'poison_pct': 45, 'necro_pct': 30, 'regen': -1}),
+        ('Soulreaper', {'leech': 1}, {'leech': 3, 'mana': 14}, 'Lich', {'leech': 8, 'mana': 40, 'hp_mult': -25})]),
+    ('Warlock', {'necro_pct': 6, 'fire_pct': 6}, {'fire_pct': 8, 'leech': 1}, {'fire_pct': 8}, {'necro_pct': 14, 'hp': 14}, [
+        ('Hexer', {'necro_pct': 9}, {'necro_pct': 16, 'crit': 4}, 'Curse Master', {'necro_pct': 45, 'crit': 20, 'armor': -15}),
+        ('Infernalist', {'fire_pct': 9}, {'fire_pct': 18, 'aoe_pct': 10}, 'Hellfire', {'fire_pct': 60, 'aoe_pct': 25, 'hp_mult': -20}),
+        ('Pactbound', {'leech': 1}, {'leech': 3, 'hp': 16}, 'Soul Debt', {'more_dmg': 35, 'hp_mult': -30, 'leech': 3})]),
+    ('Sorcerer', {'lightning_pct': 8}, {'lightning_pct': 10, 'mana': 8}, {'lightning_pct': 8}, {'chain_pct': 14, 'crit': 4}, [
+        ('Stormcaller', {'lightning_pct': 9}, {'lightning_pct': 18, 'chain_pct': 12}, 'Living Storm', {'lightning_pct': 60, 'chain_pct': 35, 'armor': -15}),
+        ('Arcanist', {'crit': 3}, {'crit': 6, 'mana': 14}, 'Overchannel', {'crit': 25, 'dmg_pct': 15, 'mana': -20}),
+        ('Wildmage', {'dmg_pct': 3}, {'fire_pct': 12, 'cold_pct': 12, 'lightning_pct': 12}, 'Chaos Flux', {'fire_pct': 40, 'cold_pct': 40, 'lightning_pct': 40, 'phys_pct': -40})]),
+    ('Wizard', {'cold_pct': 8}, {'cold_pct': 10, 'mana': 8}, {'aoe_pct': 8}, {'mana': 16, 'mregen': 1}, [
+        ('Frostweaver', {'cold_pct': 9}, {'cold_pct': 18, 'aoe_pct': 10}, 'Glacier', {'cold_pct': 60, 'aoe_pct': 30, 'movement_pct': -20}),
+        ('Scholar', {'mana': 10}, {'mana': 22, 'mregen': 2}, 'Archmind', {'mana': 70, 'mregen': 3, 'hp_mult': -15}),
+        ('Evoker', {'aoe_pct': 9}, {'aoe_pct': 18, 'dmg_pct': 5}, 'Cataclysm', {'aoe_pct': 55, 'more_dmg': 15, 'crit': -5})]),
+    ('Mage', {'fire_pct': 8}, {'fire_pct': 8, 'dmg_pct': 3}, {'projectile_pct': 8}, {'fire_pct': 14, 'mana': 10}, [
+        ('Pyromancer', {'fire_pct': 9}, {'fire_pct': 18, 'projectile_pct': 10}, 'Phoenix Fire', {'fire_pct': 65, 'projectile_pct': 25, 'armor': -15}),
+        ('Battlemage', {'armor': 6}, {'armor': 12, 'dmg_pct': 6}, 'Spellblade', {'melee_pct': 40, 'fire_pct': 25, 'mana': -15}),
+        ('Channeler', {'mana': 8}, {'mana': 16, 'dmg_pct': 6}, 'Focus', {'dmg_pct': 30, 'mana': 30, 'hp_mult': -10})]),
+]
+NCLS = len(CLASSES)
+CLS_COL = [2, 2, 4, 6, 3, 3, 5, 5, 6, 7, 7, 1]
+
+
+def build_passive():
+    t = Tree()
+    org = t.add((0, 0), 'Origin', 'origin', {})
+    pos = lambda k, along, across: (
+        math.cos(2 * math.pi * k / NCLS - math.pi / 2) * (4.2 + along * 2.0) - math.sin(2 * math.pi * k / NCLS - math.pi / 2) * across * 1.35,
+        math.sin(2 * math.pi * k / NCLS - math.pi / 2) * (4.2 + along * 2.0) + math.cos(2 * math.pi * k / NCLS - math.pi / 2) * across * 1.35)
+    gates, outer = [], []
+    for k, (cn, sig, gate, tm, tn, arms) in enumerate(CLASSES):
+        g = t.add(pos(k, 0, 0), f'Path of the {cn}', 'gate', gate, k)
+        t1 = t.add(pos(k, 1, 0), f'{cn} Training', 'minor', tm, k)
+        t2 = t.add(pos(k, 2, 0), f'{cn} Mastery', 'notable', tn, k)
+        t.link(org, g), t.link(g, t1), t.link(t1, t2)
+        gates.append(g)
+        firsts, keys, outs = [], [], []
+        for i, (an, mn, nt, kn, ks) in enumerate(arms):
+            a1 = t.add(pos(k, 3.2, (i - 1) * 1.7), f'{an} I', 'minor', mn, k)
+            a2 = t.add(pos(k, 4.6, (i - 1) * 1.7), f'{an} II', 'notable', nt, k)
+            ky = t.add(pos(k, 6.2, (i - 1) * 1.7), kn, 'key', ks, k)
+            t.link(t2, a1), t.link(a1, a2), t.link(a2, ky)
+            firsts.append(a1), keys.append(ky), outs.append(a2)
+        t.exclude(*firsts)
+        t.exclude(*keys)
+        outer.append(outs)
+    for k in range(NCLS):
+        n = (k + 1) % NCLS
+        # opposite classes close each other: a build commits to a side of the circle
+        for o in ((k + NCLS // 2) % NCLS, (k + NCLS // 2 + 1) % NCLS):
+            t.n[gates[k]]['excl'].add(gates[o])
+            t.n[gates[o]]['excl'].add(gates[k])
+        ca, cb = CLASSES[k], CLASSES[n]
+        # ring node between neighbouring gates, bridge node between their outer arms
+        gx = [(t.n[gates[k]]['id'][i] + t.n[gates[n]]['id'][i]) / 2 for i in (0, 1)]
+        rg = t.add(gx, f'{ca[0]}-{cb[0]} Kinship', 'minor', tsum(half(ca[1]), half(cb[1])), None)
+        t.link(gates[k], rg), t.link(gates[n], rg)
+        a, b = outer[k][2], outer[n][0]
+        mx = [(t.n[a]['id'][i] + t.n[b]['id'][i]) / 2 for i in (0, 1)]
+        br = t.add(mx, f'{ca[0]}-{cb[0]} Bond', 'notable', tsum(half(ca[5][2][2]), half(cb[5][0][2])), None)
+        t.link(a, br), t.link(b, br)
+    return t
+
+
+# ---- skill mastery trees: three aspects (Power, Control, Technique), each forks into two exclusive options that end in a
+# capstone. Only one capstone per skill: you decide what the skill becomes.
+def build_skill(key):
+    sk, sp = SKILLS[key], SPECIALS.get(key)
+    tags = sk['tags']
+    t = Tree()
+    org = t.add((0, 0), sk['name'], 'origin', {})
+    if 'aoe' in tags:
+        c1 = ('Wide Reach', {'sk_radius': 1})
+    elif 'chain' in tags:
+        c1 = ('Long Arc', {'sk_chain': 1})
+    elif 'rng' in sk or 'projectile' in tags:
+        c1 = ('Far Sight', {'sk_range': 2})
+    else:
+        c1 = ('Crippling', {'sk_slow': 2})
+    cap_key = sp['key'][0] if sp else ('Overdrive', {'sk_dmg': 70, 'sk_cost': -4})
+    n0, n1 = (sp['notable'] + [('Surge', {'sk_dmg': 25}), ('Vigor', {'sk_leech': 8})])[:2] if sp else (('Surge', {'sk_dmg': 25}), ('Vigor', {'sk_leech': 8}))
+    asp = [
+        ('Power', [('Might', {'sk_dmg': 10}), ('Keen Edge', {'sk_dmg': 15, 'sk_crit': 6})],
+         [('Overload', {'sk_dmg': 40, 'sk_cost': -2}), cap_key],
+         [('Precision', {'sk_crit': 18}), ('Executioner', {'sk_crit': 40, 'sk_dmg': -12})]),
+        ('Control', [(c1[0], c1[1]), ('Searing', {'sk_burn': 30, 'sk_slow': 1})],
+         [('Efficiency', {'sk_cost': 3, 'sk_dmg': -8}), ('Frugal Mastery', {'sk_cost': 7, 'sk_dmg': -20})],
+         [('Echoes', {'sk_echo': 20}), ('Twin Cast', {'sk_echo': 45, 'sk_dmg': -18})]),
+        ('Technique', [('Vitality', {'sk_leech': 4}), ('Focus', {'sk_dmg': 12, 'sk_leech': 3})],
+         [n0, ('Sanguine', {'sk_leech': 18, 'sk_dmg': 15})],
+         [n1, ('Immolation', {'sk_burn': 70, 'sk_dmg': 12})]),
+    ]
+    caps, ends = [], []
+    for a, (an, mid, fa, fb) in enumerate(asp):
+        ang = a * 2 * math.pi / 3 - math.pi / 2
+        u, v = (math.cos(ang), math.sin(ang)), (-math.sin(ang), math.cos(ang))
+        at = lambda along, across: (u[0] * along * 2.1 + v[0] * across * 1.8, u[1] * along * 2.1 + v[1] * across * 1.8)
+        p1 = t.add(at(1, 0), f'{an}: {mid[0][0]}', 'minor', mid[0][1], a)
+        p2 = t.add(at(2, 0), f'{an}: {mid[1][0]}', 'notable', mid[1][1], a)
+        t.link(org, p1), t.link(p1, p2)
+        forks = []
+        for side, (fk, (cn, cs)) in enumerate(zip((fa[0], fb[0]), (fa[1], fb[1]))):
+            sgn = -1 if side == 0 else 1
+            f = t.add(at(3, sgn * 1.3), fk[0], 'notable', fk[1], a)
+            c = t.add(at(4.3, sgn * 1.5), cn, 'key', cs, a)
+            t.link(p2, f), t.link(f, c)
+            forks.append(f), caps.append(c)
+        t.exclude(*forks)
+        ends.append(forks)
+    t.exclude(*caps)
+    for a in range(3):
+        b = (a + 1) % 3
+        pa, pb = ends[a][1], ends[b][0]
+        mx = [(t.n[pa]['id'][i] + t.n[pb]['id'][i]) / 2 for i in (0, 1)]
+        br = t.add(mx, f'{asp[a][0]}/{asp[b][0]} Link', 'minor', {'sk_dmg': 8, 'sk_leech': 2}, None)
+        t.link(pa, br), t.link(pb, br)
+    return t
+
+
+_TREES = {}
+
+
+def tree_of(key=None):
+    if key not in _TREES:
+        _TREES[key] = build_skill(key) if key else build_passive()
+    return _TREES[key]
+
+
+# ---- world: a grid of forest zones joined by gaps in the trees. Camps are the crossroads, dungeons hide in dead-end wilds.
+ZW, ZH = 9, 7
+HOME = (1, 3)
+DIRS = {'N': (0, -1), 'S': (0, 1), 'W': (-1, 0), 'E': (1, 0)}
+OPP = {'N': 'S', 'S': 'N', 'W': 'E', 'E': 'W'}
+EXIT_AT = {'N': (W // 2, 0), 'S': (W // 2, H - 1), 'W': (0, H // 2), 'E': (W - 1, H // 2)}
+EXIT_IN = {'N': (W // 2, 1), 'S': (W // 2, H - 2), 'W': (1, H // 2), 'E': (W - 2, H // 2)}
+ZPRE = ['Mossy', 'Ashen', 'Thorn', 'Gloomy', 'Silent', 'Wild', 'Ember', 'Frost', 'Pale', 'Rotting', 'Sunken', 'Twisted', 'Howling']
+ZNOUN = ['Glade', 'Thicket', 'Hollow', 'Clearing', 'Woods', 'Grove', 'Fen', 'Ridge', 'Dell', 'Copse', 'Meadow']
+CAMPNAME = ['Hearthrest', 'Ashfire Camp', 'Lantern Rest', 'Oakshield Camp', "Wayfarer's Rest", 'Fernwatch', 'Stonering Camp', 'Embergate']
+DUNGEON_KIND = ['Barrow', 'Crypt', 'Warren', 'Catacombs', 'Sunken Mine', 'Bone Vault', 'Deep Hollow']
+DIRNAME = {'N': 'north', 'S': 'south', 'W': 'west', 'E': 'east'}
+NPC_KINDS = ['Quartermaster', 'Ranger', 'Elder']
+
+
+def build_world(seed):
+    r = random.Random(f'{seed}:world')
+    cells = [(x, y) for x in range(ZW) for y in range(ZH)]
+    links = {c: set() for c in cells}
+    nb = lambda c: [(d, (c[0] + dx, c[1] + dy)) for d, (dx, dy) in DIRS.items() if (c[0] + dx, c[1] + dy) in links]
+    # randomized Prim: bushy tree, so there are real junctions
+    seen, front = {HOME}, [(HOME, d, n) for d, n in nb(HOME)]
+    while front:
+        a, d, b = front.pop(r.randrange(len(front)))
+        if b in seen:
+            continue
+        links[a].add(d), links[b].add(OPP[d])
+        seen.add(b)
+        front += [(b, d2, n2) for d2, n2 in nb(b) if n2 not in seen]
+    for c in cells:  # shortcuts: not every path is a dead end
+        for d, n in nb(c):
+            if d not in links[c] and r.random() < 0.2:
+                links[c].add(d), links[n].add(OPP[d])
+    while len(links[HOME]) < 2:
+        d, n = r.choice([(d, n) for d, n in nb(HOME) if d not in links[HOME]])
+        links[HOME].add(d), links[n].add(OPP[d])
+    dist, todo = {HOME: 0}, [HOME]
+    for c in todo:
+        for d in links[c]:
+            n = (c[0] + DIRS[d][0], c[1] + DIRS[d][1])
+            if n not in dist:
+                dist[n] = dist[c] + 1
+                todo.append(n)
+    camps = [HOME]
+    for gap in (5, 4, 3):
+        for c in r.sample(cells, len(cells)):
+            if len(links[c]) >= 3 and c not in camps and all(abs(c[0] - o[0]) + abs(c[1] - o[1]) >= gap for o in camps):
+                camps.append(c)
+    zones, names = {}, set()
+    for c in cells:
+        lvl = 1 + int(dist[c] * 2.0)
+        if c in camps:
+            nm = r.choice([n for n in CAMPNAME if n not in names] or CAMPNAME)
+            kind = 'camp'
+        else:
+            nm = f'{r.choice(ZPRE)} {r.choice(ZNOUN)}'
+            while nm in names:
+                nm = f'{r.choice(ZPRE)} {r.choice(ZNOUN)}'
+            kind = 'wild'
+        names.add(nm)
+        zones[c] = dict(pos=c, kind=kind, level=lvl, name=nm, links=sorted(links[c]), dungeon=None)
+    wild = [c for c in cells if zones[c]['kind'] == 'wild' and zones[c]['level'] >= 2]
+    ends = [c for c in wild if len(links[c]) == 1]
+    pick = [c for c in ends if r.random() < 0.75] + [c for c in wild if len(links[c]) == 2 and r.random() < 0.1]
+    early = [c for c in ends if zones[c]['level'] <= 7]
+    if early and not any(zones[c]['level'] <= 7 for c in pick):
+        pick.append(r.choice(early))
+    for c in pick:
+        z = zones[c]
+        z['dungeon'] = dict(name=f'{r.choice(DUNGEON_KIND)} of {r.choice(RARE_A)}', floors=min(9, 3 + z["level"] // 5))
+    return zones
 
 
 class Game:
@@ -267,6 +471,7 @@ class Game:
         self.cd, self.buffs, self.log = {}, {}, []
         self.cons, self.keys, self.res = {'hp': 2, 'mp': 1}, 0, {'scrap': 0, 'essence': 0}
         self.mastery = {}
+        self.zones, self.visited, self.camp, self.npcs, self.floor = build_world(self.seed), set(), HOME, {}, 0
         self.chests, self.potion_cd = {}, 0
         self.filter = {'normal': 'salvage', 'magic': 'keep', 'rare': 'keep'}
         self.runes = {}
@@ -275,12 +480,13 @@ class Game:
         self.turn = 0
         self.dead = False
         self.hp, self.mana = 60, 30
-        self.new_level()
+        self.enter(HOME, 0)
         self.hp, self.mana = self.st('hp'), self.st('mana')
 
     # ---- persistence (current level is regenerated from seed+depth on load)
     def save(self):
-        d = dict(seed=self.seed, depth=self.depth, lvl=self.lvl, xp=self.xp, points=self.points, alloc=sorted(self.alloc),
+        d = dict(seed=self.seed, depth=self.depth, zpos=list(self.zpos), floor=self.floor, visited=sorted(self.visited),
+                 camp=list(self.camp), pos=[self.px, self.py], lvl=self.lvl, xp=self.xp, points=self.points, alloc=sorted(self.alloc),
                  equip=self.equip, pack=self.pack, known=self.known, slots=self.slots, hp=self.hp, mana=self.mana, turn=self.turn,
                  best=getattr(self, 'best', self.depth), deaths=getattr(self, 'deaths', 0),
                  mastery={k: dict(m, alloc=sorted(m['alloc'])) for k, m in self.mastery.items()},
@@ -311,22 +517,36 @@ class Game:
         g.filter = d.get('filter', {'normal': 'salvage', 'magic': 'keep', 'rare': 'keep'})
         g.runes = d.get('runes', {})
         g.face, g.turn, g.dead = (1, 0), d['turn'], False
-        g.depth = d['depth'] - 1
         g.best, g.deaths = d.get('best', d['depth']), d.get('deaths', 0)
-        g.new_level()
+        g.zones, g.npcs, g.fcount, g.fscrap = build_world(g.seed), {}, 0, 0
+        g.visited = {tuple(v) for v in d.get('visited', [])}
+        g.camp = tuple(d.get('camp', HOME))
+        # saves from before the class trees / zone world: refund old nodes, restart at the home camp
+        tp = tree_of()
+        if any(p not in tp.n for p in g.alloc):
+            g.points += len(g.alloc) - 1
+            g.alloc = {(0, 0)}
+        for k, m in g.mastery.items():
+            if k in SKILLS and any(p not in tree_of(k).n for p in m['alloc']):
+                m['points'] += len(m['alloc']) - 1
+                m['alloc'] = {(0, 0)}
+        zp = tuple(d['zpos']) if 'zpos' in d else HOME
+        g.enter(zp, d.get('floor', 0))
+        if 'pos' in d and g.g[d['pos'][1]][d['pos'][0]] not in '#<>DEF' and not g.enemy_at(*d['pos']):
+            g.px, g.py = d['pos']
+            g.vision()
         g.hp, g.mana = min(d['hp'], g.st('hp')), min(d['mana'], g.st('mana'))
         g.say('Welcome back.')
         return g
 
     def respawn(self):
-        # death is a setback, not a wipe: lose 1 depth and a quarter of the xp bar, keep everything else
+        # death is a setback, not a wipe: lose a quarter of the xp bar and wake at the last camp, keep everything else
         self.deaths = getattr(self, 'deaths', 0) + 1
         self.xp = int(self.xp * 0.75)
-        self.depth = max(0, self.depth - 2)
         self.dead = False
-        self.new_level()
+        self.enter(self.camp, 0)
         self.hp, self.mana = self.st('hp'), self.st('mana')
-        self.say('You wake at the entrance. Depth lost, gear kept.')
+        self.say('You wake at the last camp you rested in. Gear kept.')
 
     # ---- skill mastery: casting a skill trains it; its own grid improves only that skill
     def mas(self, key):
@@ -334,8 +554,9 @@ class Game:
 
     def mstats(self, key):
         out = {}
+        tr = tree_of(key)
         for p in self.mas(key)['alloc']:
-            for k, v in node_at_skill(self.seed, key, *p)['stats'].items():
+            for k, v in tr.n[p]['stats'].items():
                 out[k] = out.get(k, 0) + v
         return out
 
@@ -357,8 +578,9 @@ class Game:
         for it in self.equip.values():
             if it:
                 add(dict(it['aff']))
+        tp = tree_of()
         for p in self.alloc:
-            add(node_at(self.seed, *p)['stats'])
+            add(tp.n[p]['stats'])
         for it in self.equip.values():
             for rk in (it or {}).get('sockets', []):
                 if rk and RUNES[rune_split(rk)[0]]['kind'] == 'stat':
@@ -381,21 +603,35 @@ class Game:
         del self.log[:-40]
 
     # ---- level gen
-    def new_level(self):
+    # ---- zones: wild forest clearings, ally camps, dungeons (floors) hidden inside wild zones
+    def where(self):
+        z = self.zone
+        if self.floor:
+            return f'{z["dungeon"]["name"].split(" of ")[0]} F{self.floor}/{z["dungeon"]["floors"]}  L{self.depth}'
+        return f'{z["name"]}  L{self.depth}'
+
+    def enter(self, zpos, floor=0, arrive=None):
         if self.fcount:
             self.say(f'Filter: {self.fcount} items cleared (+{self.fscrap} scrap)')
             self.fcount = self.fscrap = 0
-        self.depth += 1
+        z = self.zones[zpos]
+        dg = z['dungeon'] if floor else None
+        if arrive in EXIT_IN and arrive not in z['links']:
+            arrive = None
+        camp, cave = z['kind'] == 'camp', bool(floor)
+        self.zpos, self.floor, self.zone = zpos, floor, z
+        self.depth = z['level'] + floor   # "depth" is the difficulty everything scales with
         self.phoenix = False
         self.best = max(getattr(self, 'best', 0), self.depth)
-        r = random.Random(f'{self.seed}:{self.depth}')
+        self.visited.add(zpos)
+        if camp:
+            self.camp = zpos
+        self.bk_i = (zpos[0] * 7 + zpos[1] * 3) % len(BOSS_KINDS)
+        r = random.Random(f'{self.seed}:{zpos}:{floor}')
         g = [['#'] * W for _ in range(H)]
         rooms = []
-        for _ in range(80):
-            w, h = r.randint(8, 16), r.randint(6, 10)
-            x, y = r.randint(1, W - w - 2), r.randint(1, H - h - 2)
-            if any(x < a + c + 1 and a < x + w + 1 and y < b + d + 1 and b < y + h + 1 for a, b, c, d in rooms):
-                continue
+
+        def carve(x, y, w, h):
             rx, ry = w / 2, h / 2
             mx, my = x + rx - 0.5, y + ry - 0.5
             ph = r.random() * 6.28
@@ -406,80 +642,188 @@ class Game:
                     if ((i - mx) / rx) ** 2 + ((j - my) / ry) ** 2 <= lim * lim * 0.9:
                         g[j][i] = '.'
             rooms.append((x, y, w, h))
-            if len(rooms) >= 11:
-                break
-        cen = [(x + w // 2, y + h // 2) for x, y, w, h in rooms]
-        path = set()
-        for (x1, y1), (x2, y2) in zip(cen, cen[1:]):
+
+        walked = set()   # every corridor cell, so the decorations below can never cut a corridor
+
+        def dig(x1, y1, x2, y2, store):
             x, y = x1, y1
-            while (x, y) != (x2, y2):
+            while True:
+                for dx, dy in ((0, 0), (1, 0), (0, 1)):
+                    if 0 < x + dx < W - 1 and 0 < y + dy < H - 1:
+                        if g[y + dy][x + dx] == '#':
+                            store.add((x + dx, y + dy))
+                        g[y + dy][x + dx] = '.'
+                        walked.add((x + dx, y + dy))
+                if (x, y) == (x2, y2):
+                    break
                 if r.random() < 0.5 and x != x2 or y == y2:
                     x += 1 if x2 > x else -1
                 else:
                     y += 1 if y2 > y else -1
-                for dx, dy in ((0, 0), (1, 0), (0, 1)):
-                    if 0 < x + dx < W - 1 and 0 < y + dy < H - 1:
-                        if g[y + dy][x + dx] == '#':
-                            path.add((x + dx, y + dy))
-                        g[y + dy][x + dx] = '.'
+
+        if camp:
+            carve(W // 2 - 13, H // 2 - 8, 26, 16)
+        else:
+            for _ in range(80):
+                w, h = r.randint(8, 16), r.randint(6, 10)
+                x, y = r.randint(1, W - w - 2), r.randint(1, H - h - 2)
+                if any(x < a + c + 1 and a < x + w + 1 and y < b + d + 1 and b < y + h + 1 for a, b, c, d in rooms):
+                    continue
+                carve(x, y, w, h)
+                if len(rooms) >= (12 if cave else 11):
+                    break
+        cen = [(x + w // 2, y + h // 2) for x, y, w, h in rooms]
+        path, epath = set(), set()
+        for (x1, y1), (x2, y2) in zip(cen, cen[1:]):
+            dig(x1, y1, x2, y2, path)
+        if not cave:
+            for d in z['links']:
+                ix, iy = EXIT_IN[d]
+                tgt = min(cen, key=lambda c: abs(c[0] - ix) + abs(c[1] - iy))
+                dig(ix, iy, tgt[0], tgt[1], epath)
+                epath.add((ix, iy))
+                g[EXIT_AT[d][1]][EXIT_AT[d][0]] = 'E'
+            path |= epath
         for x, y in cen:
             g[y][x] = '.'
-        # terrain: trees/rocks/water block, grass/flowers/paths are floor
-        keep = set(cen) | {(x + dx, y + dy) for x, y in cen for dx in (-1, 0, 1) for dy in (-1, 0, 1)}
-        ter = [[('T' if r.random() < 0.8 else 'r') if g[j][i] == '#' else ('p' if (i, j) in path else 'f' if r.random() < 0.06 else 'g')
-                for i in range(W)] for j in range(H)]
-        for _ in range(len(rooms) * 3):
-            ox, oy = r.randint(2, W - 3), r.randint(2, H - 3)
-            kind = r.choice('~~T')
-            for _ in range(r.randint(3, 9)):
-                ox, oy = ox + r.randint(-1, 1), oy + r.randint(-1, 1)
-                if 0 < ox < W - 1 and 0 < oy < H - 1 and g[oy][ox] == '.' and (ox, oy) not in keep and (ox, oy) not in path:
-                    g[oy][ox] = '#'
-                    ter[oy][ox] = kind
-        # keep everything reachable
+        keep = set(cen) | {(x + dx, y + dy) for x, y in cen for dx in (-1, 0, 1) for dy in (-1, 0, 1)} | epath | walked
+        if cave:
+            ter = [['W' if g[j][i] == '#' else 'd' for i in range(W)] for j in range(H)]
+        else:
+            ter = [[('T' if r.random() < 0.8 else 'r') if g[j][i] == '#' else ('p' if (i, j) in path or g[j][i] == 'E' else 'f' if r.random() < 0.06 else 'g')
+                    for i in range(W)] for j in range(H)]
+            for _ in range(0 if camp else len(rooms) * 3):
+                ox, oy = r.randint(2, W - 3), r.randint(2, H - 3)
+                kind = r.choice('~~T')
+                for _ in range(r.randint(3, 9)):
+                    ox, oy = ox + r.randint(-1, 1), oy + r.randint(-1, 1)
+                    if 0 < ox < W - 1 and 0 < oy < H - 1 and g[oy][ox] == '.' and (ox, oy) not in keep and (ox, oy) not in path:
+                        g[oy][ox] = '#'
+                        ter[oy][ox] = kind
         seen_ = {cen[0]}
         todo = [cen[0]]
         while todo:
             cx_, cy_ = todo.pop()
             for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
                 n = (cx_ + dx, cy_ + dy)
-                if n not in seen_ and g[n[1]][n[0]] != '#':
+                if 0 <= n[0] < W and 0 <= n[1] < H and n not in seen_ and g[n[1]][n[0]] != '#':
                     seen_.add(n)
                     todo.append(n)
         for j in range(H):
             for i in range(W):
                 if g[j][i] != '#' and (i, j) not in seen_:
                     g[j][i] = '#'
-                    ter[j][i] = 'T'
-        self.ter = ter
-        self.g = g
-        self.px, self.py = cen[0]
-        sx, sy = cen[-1]
-        g[sy][sx] = '>'
+                    ter[j][i] = 'W' if cave else 'T'
+        self.ter, self.g = ter, g
         self.seen = [[False] * W for _ in range(H)]
-        self.items, self.en = {}, []
-        boss = self.depth % 5 == 0
-        for k, (x, y, w, h) in enumerate(rooms[1:], 1):
-            n = r.randint(1, 2 + self.depth // 3)
-            for _ in range(n):
+        self.items, self.en, self.chests, self.npcs = {}, [], {}, {}
+        sx, sy = cen[-1]
+        if cave:
+            g[cen[0][1]][cen[0][0]] = '<'
+            if floor < dg['floors']:
+                g[sy][sx] = '>'
+        elif z['dungeon']:
+            g[sy][sx] = 'D'
+        if arrive in EXIT_IN:
+            self.px, self.py = EXIT_IN[arrive]
+        else:
+            self.px, self.py = cen[-1] if arrive == 'D' else cen[0]
+            if camp:
+                self.px, self.py = cen[0][0] + 2, cen[0][1] + 1
+        if arrive == 'D' or cave:
+            self.px, self.py = (-1, -1)
+            fp = self.free_near(*(cen[-1] if arrive == 'D' else cen[0]), 1)
+            self.px, self.py = fp or (cen[-1] if arrive == 'D' else cen[0])
+        if camp:
+            self.fill_camp(r, cen[0])
+        else:
+            self.populate(r, rooms, cen, cave, floor == (dg or {}).get('floors'), (sx, sy))
+        if camp:
+            self.say(f'-- {z["name"]}: a safe camp. Rest at the fire. --')
+        elif cave:
+            self.say(f'-- {dg["name"]}, floor {floor}/{dg["floors"]} --' + ('  A boss waits below the last stair.' if floor == dg['floors'] else ''))
+        else:
+            self.say(f'-- {z["name"]} (lvl {z["level"]}) --' + (f'  {z["dungeon"]["name"]} lies here.' if z['dungeon'] else ''))
+        self.vision()
+
+    def populate(self, r, rooms, cen, cave, last, end):
+        g = self.g
+        mult = 1.35 if cave else 1.0
+        L = self.depth
+        near = lambda x, y: abs(x - self.px) + abs(y - self.py) < 9
+        for k, (x, y, w, h) in enumerate(rooms):
+            # enemy quantity grows with level: more per clearing, and bigger rooms hold more
+            n = int(r.randint(1 + L // 6, 2 + L // 3 + L // 5) * mult * (0.6 + w * h / 130))
+            for _ in range(min(n, 16)):
                 ex, ey = r.randint(x, x + w - 1), r.randint(y, y + h - 1)
-                if g[ey][ex] == '.' and (ex, ey) != (sx, sy) and not self.enemy_at(ex, ey):
+                if g[ey][ex] == '.' and (ex, ey) != end and not self.enemy_at(ex, ey) and not near(ex, ey):
                     self.spawn(ex, ey, r)
             if r.random() < 0.35:
                 dx_, dy_ = r.randint(x, x + w - 1), r.randint(y, y + h - 1)
                 if g[dy_][dx_] == '.':
                     self.drop(dx_, dy_, 0)
-        self.chests = {}
-        if len(rooms) > 3 and r.random() < 0.6:
+        if len(rooms) > 3 and r.random() < (0.95 if cave else 0.5):
             x, y, w, h = r.choice(rooms[2:-1])
             cxy = (r.randint(x, x + w - 1), r.randint(y, y + h - 1))
             if not self.enemy_at(*cxy) and g[cxy[1]][cxy[0]] == '.':
                 self.chests[cxy] = True
-        if boss:
-            bp = self.free_near(sx, sy, 1) or (sx, sy)
-            e = self.spawn(bp[0], bp[1], r, boss=True)
-        self.say(f'-- Depth {self.depth} --' + ('  A boss guards the stairs.' if boss else ''))
-        self.vision()
+        if cave and last:
+            bp = self.free_near(end[0], end[1], 1) or end
+            self.spawn(bp[0], bp[1], r, boss=True)
+        elif self.zone['dungeon'] and not cave:
+            for _ in range(2 + L // 8):  # the mouth of a dungeon is guarded
+                fp = self.free_near(end[0], end[1], 3)
+                if fp and fp != (self.px, self.py):
+                    self.spawn(fp[0], fp[1], r)
+
+    def fill_camp(self, r, c):
+        g = self.g
+        g[c[1]][c[0]] = 'F'
+        spots = [(c[0] - 4, c[1] - 2), (c[0] + 4, c[1] - 2), (c[0], c[1] + 4)]
+        for kind, (x, y) in zip(NPC_KINDS, spots):
+            if g[y][x] == '#':
+                continue
+            self.npcs[(x, y)] = dict(kind=kind)
+
+    def rest(self):
+        s = self.stats()
+        self.hp, self.mana = s['hp'], s['mana']
+        self.cons['hp'] = max(self.cons.get('hp', 0), 2)
+        self.cons['mp'] = max(self.cons.get('mp', 0), 1)
+        self.say('You rest at the fire. Life, mana and potions restored.')
+        self.save()
+
+    def travel(self, d):
+        nx, ny = self.zpos[0] + DIRS[d][0], self.zpos[1] + DIRS[d][1]
+        self.enter((nx, ny), 0, OPP[d])
+        self.save()
+
+    def bump_npc(self, pos):
+        k = self.npcs[pos]['kind']
+        if k == 'Quartermaster':
+            price = 10 + 3 * self.zone['level']
+            if self.res['scrap'] < price:
+                self.say(f'Quartermaster: potions are {price} scrap. You have {self.res["scrap"]}.')
+            else:
+                kind = 'hp' if self.cons.get('hp', 0) <= self.cons.get('mp', 0) else 'mp'
+                self.res['scrap'] -= price
+                self.cons[kind] = self.cons.get(kind, 0) + 1
+                self.say(f'Quartermaster sells you a {CONS[kind][0]} for {price} scrap.')
+        elif k == 'Ranger':
+            tgt = [(abs(c[0] - self.zpos[0]) + abs(c[1] - self.zpos[1]), c) for c, z in self.zones.items() if z['dungeon'] and c not in self.visited]
+            if not tgt:
+                self.say('Ranger: you have walked every cave I know.')
+            else:
+                c = min(tgt)[1]
+                dx, dy = c[0] - self.zpos[0], c[1] - self.zpos[1]
+                way = ' '.join(x for x in (f'{abs(dy)} {DIRNAME["N" if dy < 0 else "S"]}' if dy else '', f'{abs(dx)} {DIRNAME["W" if dx < 0 else "E"]}' if dx else '') if x)
+                self.say(f'Ranger: a dungeon lies {way} of here, past the trees.')
+        else:
+            out = []
+            for d in self.zone['links']:
+                z = self.zones[(self.zpos[0] + DIRS[d][0], self.zpos[1] + DIRS[d][1])]
+                out.append(f'{DIRNAME[d]}: {z["name"]} (lvl {z["level"]})')
+            self.say('Elder: ' + '; '.join(out))
 
     def spawn(self, x, y, r, boss=False, add=False):
         pool = [e for e in ENEMIES if e[5] <= self.depth] or ENEMIES[:1]
@@ -490,7 +834,7 @@ class Game:
         champ = not add and not boss and r.random() < 0.12
         aff, bk = [], None
         if boss:
-            bk = BOSS_KINDS[(self.depth // 5 - 1) % len(BOSS_KINDS)]
+            bk = BOSS_KINDS[self.bk_i]
             n, gl, hp, dm, xp, fl = bk['name'], bk['gl'], 70, 10, 100, ''
         elif add:
             hp, dm, xp = hp * 0.5, int(dm * 0.6), xp * 0.4
@@ -512,7 +856,7 @@ class Game:
 
     def free_near(self, x, y, r=2):
         spots = [(x + dx, y + dy) for dx in range(-r, r + 1) for dy in range(-r, r + 1)
-                 if self.g[y + dy][x + dx] != '#' and not self.enemy_at(x + dx, y + dy) and (x + dx, y + dy) != (self.px, self.py)]
+                 if self.g[y + dy][x + dx] not in '#E' and not self.enemy_at(x + dx, y + dy) and (x + dx, y + dy) != (self.px, self.py)]
         return self.rng.choice(spots) if spots else None
 
     def summon(self, e, n):
@@ -541,7 +885,7 @@ class Game:
         return False
 
     def boss_tiles(self, e, kind):
-        floor = lambda x, y: 0 <= x < W and 0 <= y < H and self.g[y][x] != '#'
+        floor = lambda x, y: 0 <= x < W and 0 <= y < H and self.g[y][x] not in '#E'
         tiles = set()
         if kind == 'slam':
             tiles = {(e['x'] + dx, e['y'] + dy) for dx in range(-2, 3) for dy in range(-2, 3)}
@@ -831,8 +1175,8 @@ class Game:
     def aff_text(self, stat, v):
         for a in AFFIXES:
             if a[0] == stat:
-                return a[1].format(v)
-        return ELABEL.get(stat, stat + ' {}').format(v)
+                return a[1].format(v).replace('+-', '-')
+        return ELABEL.get(stat, stat + ' {}').format(v).replace('+-', '-')
 
     def pickup(self):
         for it in self.items.pop((self.px, self.py), []):
@@ -1173,7 +1517,7 @@ class Game:
         path = []
         for _ in range(5 + self.mp('bl_range')):
             nx, ny = x + dx, y + dy
-            if self.g[ny][nx] == '#' or self.enemy_at(nx, ny):
+            if self.g[ny][nx] in '#E' or self.enemy_at(nx, ny):
                 break
             x, y = nx, ny
             path.append((x, y))
@@ -1227,7 +1571,7 @@ class Game:
         hit, k = set(), 0
         for i in range(1, sk['rng'] + self.mp('sk_range') + 1):
             x, y = self.px + round(dx * i / n), self.py + round(dy * i / n)
-            if self.g[y][x] == '#':
+            if self.g[y][x] in '#E':
                 break
             e = self.enemy_at(x, y)
             if e and id(e) not in hit:
@@ -1302,6 +1646,9 @@ class Game:
             return False
         if (nx, ny) in self.chests:
             return self.open_chest(nx, ny)
+        if (nx, ny) in self.npcs:
+            self.bump_npc((nx, ny))
+            return True
         e = self.enemy_at(nx, ny)
         if e:
             d, c = self.calc(0, {'phys', 'melee'}, True)
@@ -1309,13 +1656,31 @@ class Game:
         else:
             self.px, self.py = nx, ny
             self.pickup()
+            t = self.g[ny][nx]
+            if t == 'E':
+                self.travel('N' if ny == 0 else 'S' if ny == H - 1 else 'W' if nx == 0 else 'E')
+            elif t == 'F':
+                self.rest()
         return True
 
     def descend(self):
-        if self.g[self.py][self.px] != '>':
-            self.say('No stairs here')
+        t = self.g[self.py][self.px]
+        if t == '>':
+            self.enter(self.zpos, self.floor + 1)
+        elif t == 'D':
+            self.enter(self.zpos, 1)
+        elif t == '<':
+            if self.floor > 1:
+                self.enter(self.zpos, self.floor - 1)
+            else:
+                self.enter(self.zpos, 0, 'D')
+        elif t == 'F':
+            self.rest()
             return False
-        self.new_level()
+        else:
+            self.say('Nothing to use here. Leave a zone through the gaps in the trees.')
+            return False
+        self.save()
         return True
 
     def end_turn(self):
@@ -1395,20 +1760,22 @@ class Game:
         elif dist <= 16:
             sx, sy = (dx > 0) - (dx < 0), (dy > 0) - (dy < 0)
             for mx, my in ([(sx, sy), (sx, 0), (0, sy)] if abs(dx) > abs(dy) else [(sx, sy), (0, sy), (sx, 0)]):
-                if (mx or my) and self.g[e['y'] + my][e['x'] + mx] != '#' and not self.enemy_at(e['x'] + mx, e['y'] + my) \
+                if (mx or my) and self.g[e['y'] + my][e['x'] + mx] not in '#E' and not self.enemy_at(e['x'] + mx, e['y'] + my) \
                         and (e['x'] + mx, e['y'] + my) != (self.px, self.py):
                     e['x'] += mx
                     e['y'] += my
                     break
 
     # ---- passive tree
-    def frontier(self, alloc=None):
-        out = set()
+    def locked(self, tree, alloc, p):
+        return any(e in alloc for e in tree.n[p]['excl'])
+
+    def frontier(self, alloc=None, key=None):
+        tr, out = tree_of(key), set()
         alloc = self.alloc if alloc is None else alloc
-        for x, y in alloc:
-            for d in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-                p = (x + d[0], y + d[1])
-                if p not in alloc:
+        for a in alloc:
+            for p in tr.n[a]['adj']:
+                if p not in alloc and not self.locked(tr, alloc, p):
                     out.add(p)
         return out
 
@@ -1420,15 +1787,15 @@ class Game:
             return True
         return False
 
-    def untake(self, alloc, p):
+    def untake(self, alloc, p, key=None):
         """Free respec of one node: allowed if everything else stays connected to the origin."""
         if p == (0, 0) or p not in alloc:
             return False
+        tr = tree_of(key)
         rest = alloc - {p}
         seen, todo = {(0, 0)}, [(0, 0)]
         while todo:
-            x, y = todo.pop()
-            for q in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
+            for q in tr.n[todo.pop()]['adj']:
                 if q in rest and q not in seen:
                     seen.add(q)
                     todo.append(q)
@@ -1451,7 +1818,7 @@ class Game:
 
     def take_skill(self, key, p):
         m = self.mas(key)
-        if m['points'] > 0 and p in self.frontier(m['alloc']):
+        if m['points'] > 0 and p in self.frontier(m['alloc'], key):
             m['alloc'].add(p)
             m['points'] -= 1
             return True
@@ -1559,6 +1926,7 @@ def getin(win, btns):
 PAD = [[('↖', ord('y')), ('↑', ord('k')), ('↗', ord('u'))],
        [('←', ord('h')), ('·', ord('.')), ('→', ord('l'))],
        [('↙', ord('b')), ('↓', ord('j')), ('↘', ord('n'))]]
+SPECIAL = {'>': '▼', '<': '▲', 'D': '∩', 'F': '♨'}
 ACTIONS = [('▼', ord('>')), ('Bag', ord('i')), ('Skl', ord('K')), ('Tre', ord('t'))]
 PANEL = 20
 
@@ -1583,8 +1951,14 @@ def draw(win, g, btns, touch):
                 continue
             t, v = g.g[y][x], (x, y) in g.vis
             tr = g.ter[y][x]
-            ch = {'T': '♣', 'r': '▲', '~': '≈'}.get(tr, '▓') if t == '#' else '▼' if t == '>' else '"' if tr == 'f' else '·'
-            col = cp(4, True) if t == '>' else cp(1)
+            if t == '#':
+                ch, col = {'T': '♣', 'r': '▲', '~': '≈'}.get(tr, '▓'), cp(1)
+            elif t == 'E':
+                ch, col = '↑' if y == 0 else '↓' if y == H - 1 else '←' if x == 0 else '→', cp(6, True)
+            elif t in SPECIAL:
+                ch, col = SPECIAL[t], cp(2, True) if t == 'F' else cp(4, True)
+            else:
+                ch, col = '"' if tr == 'f' else '·', cp(1)
             put(win, sy + my0, sx + mx0, ch, col if v else curses.A_DIM)
     for (x, y), its in g.items.items():
         if (x, y) in g.vis and inside(y - cy0, x - cx0):
@@ -1593,6 +1967,9 @@ def draw(win, g, btns, touch):
     for (x, y) in g.chests:
         if g.seen[y][x] and inside(y - cy0, x - cx0):
             put(win, y - cy0 + my0, x - cx0 + mx0, '▣', cp(4, True))
+    for (x, y) in g.npcs:
+        if (x, y) in g.vis and inside(y - cy0, x - cx0):
+            put(win, y - cy0 + my0, x - cx0 + mx0, '&', cp(3, True))
     for e in g.en:
         if e['tele']:
             for (x, y) in e['tele']['tiles']:
@@ -1606,7 +1983,8 @@ def draw(win, g, btns, touch):
     bar = lambda v, m, n: '█' * int(n * max(0, v) / max(1, m)) + '░' * (n - int(n * max(0, v) / max(1, m)))
     put(win, 0, 0, f'♥{g.hp}/{s["hp"]} {bar(g.hp, s["hp"], 10)}', cp(2, True))
     put(win, 1, 0, f'✦{g.mana}/{s["mana"]} {bar(g.mana, s["mana"], 10)}', cp(5))
-    put(win, 0, w - 22, f'Lv{g.lvl} ▼D{g.depth}' + (f' ✚{g.points}' if g.points else ''), cp(4, True))
+    hud = f'Lv{g.lvl} {g.where()}' + (f' ✚{g.points}' if g.points else '')
+    put(win, 0, max(0, w - len(hud) - 1), hud, cp(4, True))
     put(win, 1, w - 22, f'xp {g.xp}/{int(18 * g.lvl ** 1.5)}  {getattr(g, "clock", "")}', curses.A_DIM)
     put(win, 2, w - PANEL if touch else w - 22, f'⚙{g.res["scrap"]} ✧{g.res["essence"]} ⚷{g.keys}', curses.A_DIM)
     nlog = 2 if touch else 3
@@ -1619,6 +1997,7 @@ def draw(win, g, btns, touch):
                 button(win, btns, y0 + 3 * r, 1 + 6 * c, 3, 6, [lab], key, curses.A_DIM if key != ord('.') else 0)
         button(win, btns, 2, 1, 3, 9, [f'HP x{g.cons.get("hp", 0)}'], ord('p'), cp(2, True) if g.cons.get('hp') and not g.potion_cd else curses.A_DIM)
         button(win, btns, 2, 10, 3, 9, [f'MP x{g.cons.get("mp", 0)}'], ord('o'), cp(5, True) if g.cons.get('mp') and not g.potion_cd else curses.A_DIM)
+        button(win, btns, 2, 19, 3, 7, ['Map'], ord('M'), curses.A_DIM)
         y1 = h - 2 - 11
         for i, k in enumerate(g.slots):
             sk = SKILLS[k]
@@ -1629,7 +2008,7 @@ def draw(win, g, btns, touch):
             button(win, btns, y1 + 4 * (i // 2), w - PANEL + 10 * (i % 2), 4, 10,
                    [f'{i + 1} {sk["name"][:7]}', second], ord('1') + i, cp(7, True) if ready else curses.A_DIM)
         for i, (lab, key) in enumerate(ACTIONS):
-            on_stairs = key == ord('>') and g.g[g.py][g.px] == '>'
+            on_stairs = key == ord('>') and g.g[g.py][g.px] in '><DF'
             button(win, btns, y1 + 8, w - PANEL + 5 * i, 3, 5, [lab], key, cp(4, True) if on_stairs else curses.A_DIM)
     else:
         sb = ''
@@ -2020,50 +2399,87 @@ def menu_skills(win, g):
                 g.slots[i] = k
 
 
+def edge_cells(ya, xa, yb, xb):
+    """Cells of a line between two nodes: one glyph per row (steep) or per column (shallow), a terminal cell being ~1x2."""
+    dx, dy = xb - xa, yb - ya
+    slash = '╲' if dx * dy > 0 else '╱'
+    out = []
+    if abs(dy) * 2 >= abs(dx):
+        n = abs(dy)
+        xs = [round(xa + dx * i / n) for i in range(n + 1)] if n else [xa]
+        for i in range(1, n):
+            out.append((ya + (i if dy > 0 else -i), xs[i], '│' if xs[i - 1] == xs[i] == xs[i + 1] else slash))
+    else:
+        n = abs(dx)
+        ys = [round(ya + dy * i / n) for i in range(n + 1)]
+        for i in range(1, n):
+            out.append((ys[i], xa + (i if dx > 0 else -i), '─' if ys[i - 1] == ys[i] == ys[i + 1] else slash))
+    return out
+
+
 def menu_tree(win, g, key=None):
-    cx, cy = 0, 0
+    tr = tree_of(key)
+    cur = (0, 0)
     armed = False
+    zoom = 1   # 1 = 2x1 cells per grid step (whole shape), 2 = 4x2 (readable)
+    kglyph = {'minor': '○', 'notable': '◈', 'key': '★', 'gate': '◆', 'origin': '◉'}
     while True:
         win.erase()
         h, w = win.getmaxyx()
         if key:
             m = g.mas(key)
-            alloc, pts, nodefn = m['alloc'], m['points'], lambda x, y: node_at_skill(g.seed, key, x, y)
-            take = lambda p: g.take_skill(key, p)
+            alloc, pts, take = m['alloc'], m['points'], lambda p: g.take_skill(key, p)
             title = f'{SKILLS[key]["name"].upper()} MASTERY lv{m["lvl"]} ({m["xp"]}/{int(6 * (m["lvl"] + 1) ** 1.5)})'
         else:
-            alloc, pts, nodefn, take, title = g.alloc, g.points, lambda x, y: node_at(g.seed, x, y), g.take, 'TREE'
+            alloc, pts, take, title = g.alloc, g.points, g.take, 'CLASS PATHS'
         put(win, 0, 0, f'{title}  points:{pts}  tap a node to focus, tap it again to take', cp(4, True))
-        fr = g.frontier(alloc)
-        for sy in range(1, h - 7):
-            if (sy - h // 2 + 2) % 2:
+        fr = g.frontier(alloc, key)
+        cx, cy = cur
+        ox, oy = w // 2, (h - 8) // 2 + 1
+        top, bot = 1, h - 8
+        sxs, sys_ = 2 * zoom, zoom
+        scr = lambda p: (oy + (p[1] - cy) * sys_, ox + (p[0] - cx) * sxs)
+        for a, b in tr.edges:
+            (ya, xa), (yb, xb) = scr(a), scr(b)
+            if max(ya, yb) < top or min(ya, yb) > bot or max(xa, xb) < 0 or min(xa, xb) > w - 1:
                 continue
-            y = cy + (sy - h // 2 + 2) // 2
-            for sx in range(0, w - 1):
-                if (sx - w // 2) % 4:
-                    continue
-                x = cx + (sx - w // 2) // 4
-                if (x, y) in alloc:
-                    ch, a = '◉', cp(3, True)
-                elif (x, y) in fr:
-                    n = nodefn(x, y)
-                    ch = {'minor': '○', 'notable': '◈', 'key': '★'}[n['kind']]
-                    a = cp(7 if n['kind'] == 'minor' else 4 if n['kind'] == 'notable' else 6, True)
-                else:
-                    ch, a = '·', curses.A_DIM
-                if (x, y) == (cx, cy):
-                    a |= curses.A_REVERSE
-                put(win, sy, sx, ch, a)
-        n = nodefn(cx, cy)
-        state = 'taken' if (cx, cy) in alloc else 'available' if (cx, cy) in fr else 'unreachable'
-        put(win, h - 6, 0, f'{n["name"]} [{n["kind"]}] {state}' + ('   Reset again to confirm (free)' if armed else ''), cp(4, True))
+            at = cp(3) if a in alloc and b in alloc else curses.A_DIM
+            for y, x, ch in edge_cells(ya, xa, yb, xb):
+                if top <= y <= bot and 0 <= x < w - 1:
+                    put(win, y, x, ch, at)
+        for p, nd in tr.n.items():
+            y, x = scr(p)
+            if not (top <= y <= bot and 0 <= x < w - 1):
+                continue
+            col = CLS_COL[nd['cls']] if nd['cls'] is not None else 1
+            if p in alloc:
+                ch, a = '◉', cp(3, True)
+            elif p in fr:
+                ch, a = kglyph[nd['kind']], cp(col, True)
+            elif g.locked(tr, alloc, p):
+                ch, a = '✕', cp(2) | curses.A_DIM
+            else:
+                ch, a = kglyph[nd['kind']], curses.A_DIM
+            if p == cur:
+                a |= curses.A_REVERSE
+            put(win, y, x, ch, a)
+        n = tr.n[cur]
+        shut = [tr.n[e]['name'] for e in n['excl'] if e in alloc]
+        state = 'taken' if cur in alloc else 'available' if cur in fr else f'closed by {", ".join(shut)}' if shut else 'unreachable (take the path to it first)'
+        cn = f' · {CLASSES[n["cls"]][0]}' if not key and n['cls'] is not None else ''
+        put(win, h - 6, 0, f'{n["name"]} [{n["kind"]}{cn}] {state}' + ('   Reset again to confirm (free)' if armed else ''), cp(4, True))
         put(win, h - 5, 0, ', '.join(g.aff_text(k, v) for k, v in n['stats'].items()))
+        if n['excl'] and cur not in alloc:
+            put(win, h - 7, 0, 'Taking this closes: ' + ', '.join(tr.n[e]['name'] for e in sorted(n['excl'])), cp(2))
         btns = menu_bar(win, [('←', ord('h')), ('↑', ord('k')), ('↓', ord('j')), ('→', ord('l')), ('Take', 10), ('Untake', ord('x')),
-                              ('Reset' if not armed else 'SURE?', ord('r')), ('Back', 27)])
+                              ('Zoom', ord('z')), ('Reset' if not armed else 'SURE?', ord('r')), ('Back', 27)])
         win.refresh()
         c = getin(win, btns)
         if c != ord('r') and c != -1:
             armed = False
+        if c == ord('z'):
+            zoom = 3 - zoom
+            continue
         if c == ord('r'):
             if armed:
                 n = g.respec(key)
@@ -2071,7 +2487,7 @@ def menu_tree(win, g, key=None):
             armed = not armed
             continue
         if c == ord('x'):
-            if g.untake(alloc, (cx, cy)):
+            if g.untake(alloc, cur, key):
                 if key:
                     g.mas(key)['points'] += 1
                 else:
@@ -2081,20 +2497,75 @@ def menu_tree(win, g, key=None):
         if isinstance(c, tuple):
             ty, tx = c[1], c[2]
             if 1 <= ty < h - 7:
-                dx, dy = round((tx - w // 2) / 4), round((ty - h // 2 + 2) / 2)
-                if (dx, dy) == (0, 0):
-                    if not take((cx, cy)):
-                        g.say('Cannot take that')
-                cx, cy = cx + dx, cy + dy
+                wx, wy = cx + (tx - ox) / sxs, cy + (ty - oy) / sys_
+                near = min(tr.n, key=lambda p: (p[0] - wx) ** 2 + (p[1] - wy) ** 2)
+                if (near[0] - wx) ** 2 + (near[1] - wy) ** 2 <= 2.5:
+                    if near == cur:
+                        if not take(cur):
+                            g.say('Cannot take that')
+                    else:
+                        cur = near
             continue
         if c in (27, ord('q'), ord('t')):
             return
         if c in KEYS:
-            cx += KEYS[c][0]
-            cy += KEYS[c][1]
+            dx, dy = KEYS[c]
+            best, bs = None, 1e9
+            for p in tr.n:
+                vx, vy = p[0] - cx, p[1] - cy
+                dot = vx * dx + vy * dy
+                if dot <= 0:
+                    continue
+                nn = math.hypot(dx, dy)
+                perp = abs(vx * dy - vy * dx) / nn
+                sc = math.hypot(vx, vy) + 2 * perp
+                if sc < bs:
+                    best, bs = p, sc
+            if best:
+                cur = best
         elif c in (10, 13):
-            if not take((cx, cy)):
-                g.say('Cannot take that')
+            if not take(cur):
+                g.say('Cannot take that' + (' - closed by another choice' if g.locked(tr, alloc, cur) else ''))
+
+
+def menu_world(win, g):
+    while True:
+        win.erase()
+        h, w = win.getmaxyx()
+        ch = 3 if h >= ZH * 3 + 8 else 2
+        cw = 6
+        ox, oy = max(0, (w - ZW * cw) // 2), 2
+        put(win, 0, 0, 'WORLD MAP   tap to close', cp(4, True))
+        known = set(g.visited)
+        for pos in g.visited:
+            for d in g.zones[pos]['links']:
+                known.add((pos[0] + DIRS[d][0], pos[1] + DIRS[d][1]))
+        for pos, z in g.zones.items():
+            if pos not in known:
+                continue
+            cy_, cx_ = oy + pos[1] * ch + ch // 2, ox + pos[0] * cw + 1
+            seen_ = pos in g.visited
+            if pos == g.zpos:
+                lab, a = ' @', cp(5, True)
+            elif not seen_:
+                lab, a = ' ?', curses.A_DIM
+            elif z['kind'] == 'camp':
+                lab, a = ' C', cp(3, True)
+            else:
+                lab, a = f'{z["level"]:>2}', cp(1)
+            put(win, cy_, cx_, lab, a)
+            if seen_ and z['dungeon']:
+                put(win, cy_, cx_ + 2, 'D', cp(2, True))
+            for d, (sx, sy) in (('E', (cx_ + 3, cy_)), ('S', (cx_ + 1, cy_ + 1))):
+                if d in z['links'] and (seen_ or (pos[0] + DIRS[d][0], pos[1] + DIRS[d][1]) in g.visited):
+                    put(win, sy, sx, '──' if d == 'E' else '│', curses.A_DIM)
+        z = g.zone
+        put(win, oy + ZH * ch + 1, 0, f'{z["name"]} (lvl {z["level"]})' + (f' - {z["dungeon"]["name"]}, {z["dungeon"]["floors"]} floors' if z['dungeon'] else ''), cp(4, True))
+        put(win, oy + ZH * ch + 2, 0, '@ you   C camp (safe, rest at the fire)   D dungeon   numbers = zone level', curses.A_DIM)
+        win.refresh()
+        c = getin(win, [])
+        if c != -1:
+            return
 
 
 def run(win):
@@ -2182,6 +2653,8 @@ def run(win):
             menu_skills(win, g)
         elif c == ord('t'):
             menu_tree(win, g)
+        elif c == ord('M'):
+            menu_world(win, g)
         if used:
             g.end_turn()
             if g.turn % 40 == 0 or c in (ord('>'), 10, 13):
