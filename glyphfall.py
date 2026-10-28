@@ -31,7 +31,15 @@ AFFIXES = [('hp', '+{} Life', 5, 12), ('mana', '+{} Mana', 4, 10), ('weapon', '+
           [(t + '_pct', '+{}% ' + t.title() + ' Dmg', 8, 20) for t in TAGS]
 BASES = {'weapon': ['Rusty Blade', 'Bone Club', 'Cleaver', 'Glaive', 'Wand', 'Hookblade'],
          'armor': ['Rags', 'Hide Vest', 'Chain Coat', 'Plate Scrap', 'Ash Robe'],
+         'head': ['Cracked Skull', 'Leather Cap', 'Iron Helm', 'Horned Visor', 'Ash Hood'],
+         'hands': ['Wraps', 'Hide Gloves', 'Chain Mitts', 'Plate Gauntlets', 'Ash Gloves'],
+         'legs': ['Tatters', 'Hide Leggings', 'Chain Greaves', 'Plate Cuisses', 'Ash Breeches'],
+         'boots': ['Rag Wraps', 'Hide Boots', 'Chain Sabatons', 'Plate Sabatons', 'Ash Sandals'],
+         'sash': ['Frayed Cord', 'Hide Belt', 'Chain Girdle', 'Plate Girdle', 'Ash Sash'],
+         'offhand': ['Buckler', 'Bone Shield', 'Kite Shield', 'Tower Shield', 'Orb', 'Grimoire', 'Skull Lantern', 'Rune Prism'],
          'charm': ['Fang', 'Rune Stone', 'Eye Idol', 'Ember Shard', 'Bone Ring']}
+WEAPON_2H = ['Greataxe', 'Warhammer', 'Greatsword', 'Bone Staff', 'Halberd']
+OFFHAND_FOCUS = {'Orb', 'Grimoire', 'Skull Lantern', 'Rune Prism'}
 PRE = ['Sturdy', 'Fierce', 'Gloomy', 'Wicked', 'Feral', 'Hexed', 'Arcane', 'Savage']
 RARE_A = ['Doom', 'Gore', 'Dread', 'Soul', 'Void', 'Rot', 'Storm', 'Ash']
 RARE_B = ['Bite', 'Coil', 'Brand', 'Edge', 'Veil', 'Grip', 'Song', 'Maw']
@@ -68,12 +76,12 @@ POWER_TEXT = {
 }
 UNIQUES = [
     dict(name='Prismatic Idol', slot='charm', power='skill_fusion', base={'crit': 6, 'mana': 15}),
-    dict(name='Twinned Blade', slot='weapon', power='double_slot', base={'weapon': 6, 'dmg_pct': 12}),
+    dict(name='Twinned Blade', slot='weapon', hands='2h', power='double_slot', base={'weapon': 6, 'dmg_pct': 12}),
     dict(name='Soulbinder Robe', slot='armor', power='mana_to_life', base={'armor': 8, 'mana': 25, 'leech': 3}),
     dict(name="Reaper's Tally", slot='charm', power='kill_streak', base={'crit': 4, 'weapon': 2}),
     dict(name="Gambler's Fang", slot='charm', power='find_idol', base={'dmg_pct': 8}),
     dict(name='Phoenix Coil', slot='armor', power='deathless', base={'hp': 30, 'armor': 10, 'regen': 2}),
-    dict(name='Wyrmfang', slot='weapon', power='inferno', base={'weapon': 5, 'fire_pct': 35}),
+    dict(name='Wyrmfang', slot='weapon', hands='2h', power='inferno', base={'weapon': 5, 'fire_pct': 35}),
 ]
 
 # ---- skill-specific mastery nodes: {skill: {'notable': [(name, stats)], 'key': [(name, stats)]}}
@@ -159,7 +167,11 @@ BOSS_KINDS = [dict(name='Warden', gl='Ω', tele='slam', info='slams the ground a
               dict(name='Bone Queen', gl='Σ', tele='cross', info='fires bone lines along her row and column')]
 
 
-SLOTNAME = {'weapon': 'Weapon', 'armor': 'Armor', 'charm': 'Amulet'}
+SLOTNAME = {'weapon': 'Weapon', 'offhand': 'Off-hand', 'armor': 'Body', 'head': 'Head', 'hands': 'Hands', 'legs': 'Legs',
+            'boots': 'Boots', 'sash': 'Sash', 'charm': 'Amulet'}
+ARMOR_SLOTS = ('armor', 'head', 'hands', 'legs', 'boots', 'sash')  # 'armor' = body (kept for old saves)
+ARMOR_BASE = {'armor': 3, 'head': 2, 'hands': 1, 'legs': 2, 'boots': 1, 'sash': 1}
+TAB_GROUP = {'weapon': ('weapon', 'offhand'), 'armor': ARMOR_SLOTS}
 CONS = {'hp': ('Health Potion', 'Heal 40% of max life'), 'mp': ('Mana Potion', 'Restore 60% of max mana'),
         'rejuv': ('Rejuvenation', 'Heal and restore 50% of both'), 'map': ('Map Scroll', 'Reveal the whole level')}
 SALVAGE = {'normal': 2, 'magic': 5, 'rare': 14, 'legend': 60, 'mythic': 200, 'unique': 120}
@@ -248,7 +260,7 @@ class Game:
         self.depth = 0
         self.lvl, self.xp, self.points = 1, 0, 0
         self.alloc = {(0, 0)}
-        self.equip = {'weapon': None, 'armor': None, 'charm': None}
+        self.equip = {k: None for k in ('weapon', 'offhand', 'armor', 'head', 'hands', 'legs', 'boots', 'sash', 'charm')}
         self.pack = []
         self.known = list(START_SKILLS)
         self.slots = list(START_SKILLS)
@@ -286,6 +298,8 @@ class Game:
         g.rng = random.Random(g.seed + d['turn'])
         g.alloc = {tuple(p) for p in d['alloc']}
         g.equip, g.pack, g.known, g.slots = d['equip'], [tuple_aff(i) for i in d['pack']], d['known'], d['slots']
+        for k in SLOTNAME:
+            g.equip.setdefault(k, None)
         for k, it in g.equip.items():
             if it:
                 tuple_aff(it)
@@ -617,15 +631,17 @@ class Game:
                 return
         self.items.setdefault((x, y), []).append(it)
 
-    def roll_affixes(self, slot, rar, ilvl):
+    def roll_affixes(self, slot, rar, ilvl, sub=None):
         r = self.rng
         n = {'normal': 0, 'magic': r.randint(1, 2), 'rare': r.randint(3, 4), 'legend': r.randint(5, 6), 'mythic': r.randint(6, 7)}[rar]
         aff, used = [], set()
         sc = (1 + 0.08 * ilvl) * (1.5 ** ((ilvl - 1) // 10)) * (1.4 if rar == 'mythic' else 1)
         if slot == 'weapon':
-            aff.append(('weapon', int((2 + r.randint(0, 2)) * sc)))
-        if slot == 'armor':
-            aff.append(('armor', int((3 + r.randint(0, 3)) * sc)))
+            aff.append(('weapon', int((2 + r.randint(0, 2)) * sc * (1.7 if sub == '2h' else 1))))
+        if slot == 'offhand':
+            aff.append(('armor', int((3 + r.randint(0, 2)) * sc)) if sub == 'shield' else ('mana', int((6 + r.randint(0, 6)) * sc)))
+        if slot in ARMOR_SLOTS:
+            aff.append(('armor', int((ARMOR_BASE[slot] + r.randint(0, 3)) * sc)))
         for _ in range(n):
             a = r.choice(AFFIXES)
             if a[0] in used:
@@ -638,13 +654,20 @@ class Game:
         r = self.rng
         x = r.random() / (find * (1 + bonus * 0.4)) ** 0.5
         rar = 'mythic' if x < 0.0015 and ilvl >= 6 else 'legend' if x < 0.012 else 'rare' if x < 0.10 else 'magic' if x < 0.40 else 'normal'
-        slot = r.choice(['weapon', 'armor', 'charm'])
-        aff = self.roll_affixes(slot, rar, ilvl)
-        base = r.choice(BASES[slot])
+        slot = r.choice(['weapon', 'weapon', 'offhand', 'armor', 'head', 'hands', 'legs', 'boots', 'sash', 'charm'])
+        extra = {}
+        if slot == 'weapon':
+            base = r.choice(BASES['weapon'] + WEAPON_2H)
+            extra['hands'] = '2h' if base in WEAPON_2H else '1h'
+        else:
+            base = r.choice(BASES[slot])
+            if slot == 'offhand':
+                extra['kind'] = 'focus' if base in OFFHAND_FOCUS else 'shield'
+        aff = self.roll_affixes(slot, rar, ilvl, extra.get('hands') or extra.get('kind'))
         name = base if rar == 'normal' else f'{r.choice(PRE)} {base}' if rar == 'magic' else \
             f'{r.choice(RARE_A)}{r.choice(RARE_B).lower()} {base}' if rar == 'rare' else \
             f'★ {r.choice(RARE_A)}{r.choice(RARE_B).lower()}, the {base}' if rar == 'legend' else f'☀ Mythic {r.choice(RARE_A)}{r.choice(RARE_B).lower()} {base}'
-        it = dict(slot=slot, rarity=rar, name=name, aff=aff, ilvl=ilvl,
+        it = dict(slot=slot, rarity=rar, name=name, aff=aff, ilvl=ilvl, **extra,
                   sockets=[None] * r.randint(1 if rar in ('rare', 'legend', 'mythic') else 0, SOCKET_MAX[rar]))
         if rar in ('legend', 'mythic'):
             it['power'], it['rank'] = r.choice(LEGEND_POWERS), 2 if rar == 'mythic' else 1
@@ -691,7 +714,7 @@ class Game:
             sc = (1 + 0.08 * self.depth) * (1.5 ** ((self.depth - 1) // 10))
             it['aff'] = [(k, max(1, int(v * sc))) for k, v in u['base'].items()]
         else:
-            it['aff'] = self.roll_affixes(it['slot'], it['rarity'], self.depth)
+            it['aff'] = self.roll_affixes(it['slot'], it['rarity'], self.depth, it.get('hands') or it.get('kind'))
         it['ilvl'] = self.depth
         self.say(f'Reforged {it["name"]} for depth {self.depth}')
         return True
@@ -706,7 +729,7 @@ class Game:
         it['rarity'], it['rank'] = 'mythic', 2
         it['name'] = '☀ Mythic ' + it['name'][2:]
         it['ilvl'] = self.depth
-        it['aff'] = self.roll_affixes(it['slot'], 'mythic', self.depth)
+        it['aff'] = self.roll_affixes(it['slot'], 'mythic', self.depth, it.get('hands') or it.get('kind'))
         it.setdefault('sockets', [])
         while len(it['sockets']) < 3:
             it['sockets'].append(None)
@@ -797,8 +820,9 @@ class Game:
         have = {i['name'] for i in self.pack} | {i['name'] for i in self.equip.values() if i}
         u = self.rng.choice([u for u in UNIQUES if u['name'] not in have] or UNIQUES)
         sc = (1 + 0.08 * self.depth) * (1.5 ** ((self.depth - 1) // 10))
+        extra = {'hands': u['hands']} if 'hands' in u else {}
         return dict(slot=u['slot'], rarity='unique', name=u['name'], aff=[(k, max(1, int(v * sc))) for k, v in u['base'].items()],
-                    ilvl=self.depth, power=u['power'], rank=1, sockets=[None] * 2)
+                    ilvl=self.depth, power=u['power'], rank=1, sockets=[None] * 2, **extra)
 
     def drop_unique(self, x, y):
         self.items.setdefault((x, y), []).append(self.make_unique())
@@ -1433,13 +1457,33 @@ class Game:
             return True
         return False
 
+    def equip_key(self, it):
+        # where an item goes: 1h weapons dual-wield into the free off-hand, offhand/2h exclude each other
+        sl = it['slot']
+        if sl == 'weapon' and it.get('hands', '1h') == '1h':
+            main, off = self.equip['weapon'], self.equip['offhand']
+            if main and main.get('hands', '1h') == '1h' and not off:
+                return 'offhand'
+        return sl
+
     def equip_item(self, i):
         it = self.pack[i]
-        old = self.equip[it['slot']]
-        self.equip[it['slot']] = it
+        key = self.equip_key(it)
+        old = self.equip[key]
+        self.equip[key] = it
         self.pack.pop(i)
         if old:
             self.pack.append(old)
+        # two-hander clears the off-hand; an off-hand item evicts a worn two-hander
+        main, off = self.equip['weapon'], self.equip['offhand']
+        if key == 'weapon' and it.get('hands') == '2h' and off:
+            self.pack.append(off)
+            self.equip['offhand'] = None
+            self.say(f'{off["name"]} unequipped (two-handed)')
+        elif key == 'offhand' and main and main.get('hands') == '2h':
+            self.pack.append(main)
+            self.equip['weapon'] = None
+            self.say(f'{main["name"]} unequipped (off-hand in use)')
         self.hp = min(self.hp, self.st('hp'))
 
 
@@ -1613,7 +1657,7 @@ def item_lines(g, it):
     if it['slot'] == 'gem':
         sk = SKILLS[it['skill']]
         return [(f'Skill gem: {sk["name"]}', cp(7, True)), (sk['desc'], 0), ('Tags: ' + ' '.join(sorted(sk['tags'])), curses.A_DIM)]
-    out = [(it['name'], cp(RCOL[it['rarity']], True)), (f'{it["rarity"]} {SLOTNAME[it["slot"]]} ilvl {it.get("ilvl", 1)}', curses.A_DIM)]
+    out = [(it['name'], cp(RCOL[it['rarity']], True)), (f'{it["rarity"]} {ITEM_SUB.get(it.get("hands") or it.get("kind"), SLOTNAME[it["slot"]])} ilvl {it.get("ilvl", 1)}', curses.A_DIM)]
     out += [('  ' + g.aff_text(k, v), 0) for k, v in it['aff']]
     for rk in it.get('sockets', []):
         if rk:
@@ -1632,6 +1676,7 @@ def scroll_top(sel, avail, n):
     return max(0, min(sel - avail + 1, n - avail)) if sel >= avail else 0
 
 
+ITEM_SUB = {'2h': 'Two-hand weapon', '1h': 'One-hand weapon', 'shield': 'Shield', 'focus': 'Focus'}
 TABS = [('Worn', 'worn'), ('Weap', 'weapon'), ('Armor', 'armor'), ('Amulet', 'charm'), ('Items', 'cons'), ('Keys', 'key'), ('Runes', 'rune'), ('Res', 'res')]
 PAGE = 16
 
@@ -1649,8 +1694,9 @@ def bag_entries(g, tab):
                             ('3 of the same fuse into 1 of the next tier.' + ('' if g.runes[k] >= 3 else ' (need 3)'), dim),
                             ('Socket them into gear from the Socket button.', dim)]) for k in ks]
     if kind in SLOTNAME:
+        grp = TAB_GROUP.get(kind, (kind,))
         return [dict(kind='gear', idx=i, it=it, label=it['name'], attr=cp(RCOL[it['rarity']], True))
-                for i, it in enumerate(g.pack) if it['slot'] == kind]
+                for i, it in enumerate(g.pack) if it['slot'] in grp]
     if kind == 'cons':
         return [dict(kind='cons', key=k, label=f'{CONS[k][0]} x{g.cons.get(k, 0)}', attr=cp(4, True) if g.cons.get(k) else dim,
                      lines=[(CONS[k][0], cp(4, True)), (CONS[k][1], 0), (f'You have {g.cons.get(k, 0)}. Main screen: p = HP, o = MP', dim)])
@@ -1811,7 +1857,7 @@ def menu_inv(win, g):
         btns = []
         tw = w // len(TABS)
         for i, (lab, kind) in enumerate(TABS):
-            cnt = sum(1 for it in g.pack if it['slot'] == kind) if kind in SLOTNAME else sum(1 for v in g.equip.values() if v) if kind == 'worn' else ''
+            cnt = sum(1 for it in g.pack if it['slot'] in TAB_GROUP.get(kind, (kind,))) if kind in SLOTNAME else sum(1 for v in g.equip.values() if v) if kind == 'worn' else ''
             button(win, btns, 0, i * tw, 3, tw, [f'{lab} {cnt}'.strip()], 1000 + i, cp(4, True) if i == tab else curses.A_DIM)
         ch = max(1, min(3, (h - 7) // 4))
         cw = half // 4
@@ -1848,7 +1894,7 @@ def menu_inv(win, g):
                 if it['rarity'] == 'legend':
                     k = 1 + g.depth / 10
                     put(win, y + 2, half + 1, f'Ascend {int(400 * k)} scrap + 40 ess -> mythic', curses.A_DIM)
-                eq = g.equip[it['slot']]
+                eq = g.equip[g.equip_key(it)]
                 if not e.get('worn'):
                     put(win, y + 3, half + 1, 'Equipped: ' + (eq['name'] if eq else '-'), cp(RCOL[eq['rarity']]) if eq else curses.A_DIM)
         bw = w // 7
